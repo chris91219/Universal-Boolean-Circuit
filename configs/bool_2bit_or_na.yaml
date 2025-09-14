@@ -1,0 +1,18 @@
+task: "(a&b)|(~a)"         # or a named task your tasks.py understands
+L: 2
+S: 2
+steps: 1200
+lr: 0.05
+optimizer: "rmsprop"
+anneal:
+  T0: 0.35
+  Tmin: 0.12
+  direction: "top_down"
+regs:
+  lam_entropy: 1.0e-3
+  lam_div_units: 5.0e-4
+  lam_div_rows: 5.0e-4
+aux:
+  use: false
+  lam: 1.0e-2
+seed: 2024

@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv*/
+venv*/
+dist/
+build/
+*.egg-info/
+*.log
+*.out
+*.err
+experiments/runs/
+experiments/results/
+data/
+.notebooks_checkpoints/
+
