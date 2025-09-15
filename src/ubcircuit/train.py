@@ -392,18 +392,21 @@ def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
     device = _device(cfg); seed_all(cfg["seed"])
     insts = T.load_instances_jsonl(cfg["dataset"])
 
-    # Resolve a global L if requested (row L takes precedence if both set)
+    # L strategy (row / max / fixed)
     global_L: Optional[int] = None
-    if not cfg.get("use_row_L", True) and cfg.get("use_max_L", False):
+    l_strategy = "row" if cfg.get("use_row_L", True) else (
+        "max" if cfg.get("use_max_L", False) else "fixed"
+    )
+    if l_strategy == "max":
         global_L = max(int(inst.get("L", cfg["L"])) for inst in insts)
         print(f"[info] Using max L across dataset: L_max = {global_L}")
 
     results = []
     for idx, inst in enumerate(insts):
         L_override = None
-        if cfg.get("use_row_L", True) and ("L" in inst):
+        if l_strategy == "row" and ("L" in inst):
             L_override = int(inst["L"])
-        elif global_L is not None:
+        elif l_strategy == "max":
             L_override = int(global_L)
 
         res = train_single_instance(device, cfg, inst, L_override=L_override)
@@ -413,20 +416,62 @@ def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
         print(f"   label: {res['label_expr']}")
         print(f"   pred : {res['pred_expr']}")
 
-    avg_row_acc = sum(r["row_acc"] for r in results) / max(1, len(results))
-    em_rate = sum(r["em"] for r in results) / max(1, len(results))
-    equiv_rate = sum(r["equiv"] for r in results) / max(1, len(results))
+    # Aggregates (macro averages across instances)
+    n = max(1, len(results))
+    avg_row_acc = sum(r["row_acc"] for r in results) / n
+    em_rate     = sum(r["em"]      for r in results) / n
+    equiv_rate  = sum(r["equiv"]   for r in results) / n
+
+    # Histograms / breakdowns
+    from collections import Counter
+    L_used_hist = Counter(r["L_used"] for r in results)
+    S_hist      = Counter(r["S"]      for r in results)
+    B_hist      = Counter(r["B"]      for r in results)
+    simpler_hist = Counter(r["simpler"] for r in results)
+    # Ensure all keys are present
+    for k in ["pred", "label", "tie", "same"]:
+        simpler_hist.setdefault(k, 0)
+    simpler_ratios = {k: simpler_hist[k] / n for k in ["pred", "label", "tie", "same"]}
+
+    print(f"\nSimpler ratios: "
+          f"pred={simpler_ratios['pred']:.3f}, "
+          f"label={simpler_ratios['label']:.3f}, "
+          f"tie={simpler_ratios['tie']:.3f}, "
+          f"same={simpler_ratios['same']:.3f}")
+
+    # Dataset-aware config snapshot
+    cfg_eff = dict(cfg)
+    if cfg_eff.get("dataset"):
+        if l_strategy == "row":
+            cfg_eff["L"] = "per-row"
+        elif l_strategy == "max":
+            cfg_eff["L"] = "global_max"
+            cfg_eff["L_max"] = global_L
+        cfg_eff["S"] = "per-row"
+        cfg_eff.pop("task", None)
+
     out_dir.mkdir(parents=True, exist_ok=True)
     summary = {
-        "config": cfg,
+        "config": cfg_eff,
+        "l_strategy": l_strategy,
         "avg_row_acc": avg_row_acc,
         "em_rate": em_rate,
         "equiv_rate": equiv_rate,
+        "hist": {
+            "L_used": dict(L_used_hist),
+            "S": dict(S_hist),
+            "B": dict(B_hist),
+        },
+        "simpler": {
+            "counts": {k: simpler_hist[k] for k in ["pred", "label", "tie", "same"]},
+            "ratios": simpler_ratios,
+        },
         "results": results
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     print(f"\nSaved summary to: {out_dir / 'summary.json'}")
     return summary
+
 
 
 # ---------- Single-task fallback (B=2) ----------
