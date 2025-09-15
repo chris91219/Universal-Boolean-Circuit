@@ -80,6 +80,7 @@ PY
 cd "${PROJECT_DIR}"
 python -m ubcircuit.train \
   --dataset "${DATASET}" \
+  --use_row_L \
   --config "${TMP_CFG}" \
   --out_dir "${RUN_DIR}"
 
