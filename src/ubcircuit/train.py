@@ -34,6 +34,7 @@ DEFAULT_CFG: Dict[str, Any] = {
         "start_frac": 0.0
     },
     "regs": {"lam_entropy": 1.0e-3, "lam_div_units": 5.0e-4, "lam_div_rows": 5.0e-4},
+    "pair": {"repel": True, "eta": 1.0, "mode": "log"},  # right-pick repulsion
     "aux": {"use": False, "lam": 1.0e-2, "wire_targets": ["AND", "NOTA"]},
     "dataset": None,  # path to JSONL with rows like {"B":int,"S":int,"L":int,"formula":str}
     "early_stop": {
@@ -52,7 +53,7 @@ def load_config(path: str | None) -> Dict[str, Any]:
     if path:
         user = yaml.safe_load(open(path)) or {}
         for k, v in user.items():
-            if isinstance(v, dict) and k in {"anneal", "regs", "aux", "early_stop"}:
+            if isinstance(v, dict) and k in {"anneal", "regs", "aux", "early_stop", "pair"}:    
                 cfg[k] = {**cfg[k], **v}
             else:
                 cfg[k] = v
@@ -273,8 +274,8 @@ def train_single_instance(
     else:
         L_used = int(cfg["L"])
 
-    T0 = float(cfg["anneal"]["T0"])
-    model = DepthStack(B=B, L=L_used, S=S, tau=T0).to(device)
+    T0 = float(cfg["anneal"]["T0"])    
+    model = DepthStack(B=B, L=L_used, S=S, tau=T0, pair=cfg.get("pair", None)).to(device)
 
     opt_name = str(cfg["optimizer"]).lower()
     opt = (optim.RMSprop(model.parameters(), lr=cfg["lr"], alpha=0.99, eps=1e-8)
@@ -481,8 +482,8 @@ def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
     X, y_true = T.make_truth_table(cfg["task"])
     X = X.to(device); y_true = y_true.to(device)
 
-    L, S = int(cfg["L"]), int(cfg["S"])
-    model = DepthStack(B=2, L=L, S=S, tau=cfg["anneal"]["T0"]).to(device)
+    L, S = int(cfg["L"]), int(cfg["S"])    
+    model = DepthStack(B=2, L=L, S=S, tau=cfg["anneal"]["T0"], pair=cfg.get("pair", None)).to(device)
     opt = (optim.RMSprop(model.parameters(), lr=cfg["lr"], alpha=0.99, eps=1e-8)
            if cfg["optimizer"].lower() == "rmsprop" else
            optim.Adam(model.parameters(), lr=cfg["lr"]))

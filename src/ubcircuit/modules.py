@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .boolean_prims import Rep2, sigma
+from .utils import clamp01
 
 
 class BooleanUnit(nn.Module):
@@ -41,24 +42,55 @@ class PairSelector(nn.Module):
     Differentiable selection of S pairs (a_s, b_s) from B-bit input x.
     Two row-softmax matrices: PL, PR in R^{S x B}.
     """
-    def __init__(self, B: int, S: int, tau: float = 0.3):
+    def __init__(self, B: int, S: int, tau: float = 0.3,
+                 repel: bool = True, repel_eta: float = 1.0, repel_mode: str = "log"):
         super().__init__()
         self.PL = nn.Parameter(1e-3 * torch.randn(S, B))
         self.PR = nn.Parameter(1e-3 * torch.randn(S, B))
         self.S = int(S)
         self.B = int(B)
         self.tau = float(tau)
+        self.repel = bool(repel)
+        self.repel_eta = float(repel_eta)
+        assert repel_mode in {"log", "mul"}
+        self.repel_mode = repel_mode
+
+    def set_repulsion(self, repel: bool = None, eta: float = None, mode: str = None):
+        if repel is not None: self.repel = bool(repel)
+        if eta   is not None: self.repel_eta = float(eta)
+        if mode  is not None:
+            assert mode in {"log", "mul"}
+            self.repel_mode = mode
+
 
     def set_tau(self, tau: float) -> None:
         self.tau = float(tau)
 
     def forward(self, xB: torch.Tensor) -> torch.Tensor:
         """
-        xB: (BATCH, B)
-        returns pairs2: (BATCH, S, 2) with pairs2[:, s, 0]=a_s, pairs2[:, s, 1]=b_s
-        """
-        PL = F.softmax(self.PL / max(self.tau, 1e-8), dim=-1)  # (S,B)
-        PR = F.softmax(self.PR / max(self.tau, 1e-8), dim=-1)  # (S,B)
+         xB: (BATCH, B)
+         returns pairs2: (BATCH, S, 2) with pairs2[:, s, 0]=a_s, pairs2[:, s, 1]=b_s
+        """        
+        temp = max(self.tau, 1e-8)
+        # Left pick (standard)
+        PL = F.softmax(self.PL / temp, dim=-1)                 # (S,B)
+
+        # Right pick: repulsive by default
+        if self.repel:
+            if self.repel_mode == "log":
+                # log-space bias: logits_R + eta * log(1 - pL)
+                gate = torch.log(clamp01(1.0 - PL))            # (S,B)
+                adj_logits = self.PR / temp + self.repel_eta * gate
+                PR = F.softmax(adj_logits, dim=-1)
+            else:  # "mul" 
+                # Prob-space multiplicative gate 
+                w2 = F.softmax(self.PR / temp, dim=-1)     # interpret PR as logits -> probs
+                gate = (1.0 - PL)                          # (S,B)
+                pR_unnorm = self.repel_eta * gate * w2     # elementwise
+                pR = pR_unnorm / pR_unnorm.sum(dim=-1, keepdim=True)
+        else:
+            PR = F.softmax(self.PR / temp, dim=-1)             # (S,B)
+
         a = xB @ PL.t()                                        # (batch,S)
         b = xB @ PR.t()                                        # (batch,S)
         return torch.stack([a, b], dim=-1)                     # (batch,S,2)
@@ -109,7 +141,8 @@ class GeneralLayer(nn.Module):
       - If in_bits>2: PairSelector picks S pairs, apply S BooleanUnits on each pair.
       Output mixed into out_bits via row-softmax WL.
     """
-    def __init__(self, in_bits: int, S: int, out_bits: int, tau: float = 0.3):
+    def __init__(self, in_bits: int, S: int, out_bits: int, tau: float = 0.3,
+                 pair: dict | None = None):
         super().__init__()
         self.in_bits = int(in_bits)
         self.S = int(S)
@@ -117,7 +150,16 @@ class GeneralLayer(nn.Module):
         self.tau = float(tau)
         self.units = nn.ModuleList([BooleanUnit(tau=tau) for _ in range(S)])
         self.WL = nn.Parameter(1e-3 * torch.randn(out_bits, S))
-        self.selector = PairSelector(B=in_bits, S=S, tau=tau) if in_bits > 2 else None
+        if in_bits > 2:
+            pair = pair or {}
+            self.selector = PairSelector(
+                B=in_bits, S=S, tau=tau,
+                repel=pair.get("repel", True),
+                repel_eta=pair.get("eta", 1.0),
+                repel_mode=pair.get("mode", "log"),
+            )
+        else:
+            self.selector = None
 
     def set_tau(self, tau: float) -> None:
         self.tau = float(tau)
@@ -140,9 +182,27 @@ class GeneralLayer(nn.Module):
         x_next = torch.cat(next_bits, dim=-1)                        # (B,out_bits)
         unitWs = [u.W for u in self.units]
         dbg = {
-            "outs": outs, "L_rows": L_rows, "unitWs": unitWs,
-            "PL": (self.selector.PL if self.selector is not None else None),
-            "PR": (self.selector.PR if self.selector is not None else None),
+            "outs": outs,
+            "L_rows": L_rows,
+            "unitWs": unitWs,
+            "PL": (
+                F.softmax(self.selector.PL / max(self.tau, 1e-8), dim=-1)
+                if self.selector is not None else None
+            ),
+            "PR": (
+                F.softmax(
+                    self.selector.PR / max(self.tau, 1e-8)
+                    + self.selector.repel_eta * torch.log(
+                        clamp01(1.0 - F.softmax(self.selector.PL / max(self.tau, 1e-8), dim=-1))
+                    ),
+                    dim=-1,
+                )
+                if (self.selector is not None and self.selector.repel and self.selector.repel_mode == "log")
+                else (
+                    F.softmax(self.selector.PR / max(self.tau, 1e-8), dim=-1)
+                    if self.selector is not None else None
+                )
+            ),
         }
         return x_next, dbg
 
@@ -152,13 +212,14 @@ class DepthStack(nn.Module):
     L layers: first is GeneralLayer(in_bits=B, out_bits=2), middle ReasoningLayer(2->2),
     final ReasoningLayer(2->1).
     """
-    def __init__(self, B: int, L: int = 2, S: int = 2, tau: float = 0.3):
+    def __init__(self, B: int, L: int = 2, S: int = 2, tau: float = 0.3,
+                 pair: dict | None = None):
         super().__init__()
         if L < 1:
             raise ValueError("L must be >= 1")
         self.layers = nn.ModuleList([])
-        # First layer maps B -> 2 bits
-        self.layers.append(GeneralLayer(in_bits=B, S=S, out_bits=2, tau=tau))
+        # First layer maps B -> 2 bits        
+        self.layers.append(GeneralLayer(in_bits=B, S=S, out_bits=2, tau=tau, pair=pair))
         # Middle (L-2) keep 2 -> 2
         for _ in range(max(L - 2, 0)):
             self.layers.append(ReasoningLayer(S=S, out_bits=2, tau=tau))
