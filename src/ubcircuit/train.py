@@ -12,6 +12,7 @@ import yaml
 from .modules import DepthStack
 from .utils import seed_all, safe_bce, make_async_taus, regularizers_bundle
 from . import tasks as T
+from .boolean_prims16 import set_sigma16_bandwidth
 
 
 DEFAULT_CFG: Dict[str, Any] = {
@@ -19,6 +20,10 @@ DEFAULT_CFG: Dict[str, Any] = {
     "L": 2,
     "S": 2,
     "gate_set": "6",   # "6" (legacy) or "16" (compact)
+    "sigma16": {                   # NEW: bandwidth anneal (used only if gate_set == "16")
+        "s_start": 0.25,
+        "s_end": 0.10
+    },
     "steps": 1200,
     "lr": 0.05,
     "optimizer": "rmsprop",
@@ -344,7 +349,14 @@ def train_single_instance(
             phase_scale=anneal_cfg.get("phase_scale", 0.4),
             start_frac=anneal_cfg.get("start_frac", 0.0),
         )
-        model.set_layer_taus(taus)
+        # Use bandwidth scheduling if available (and useful for gate_set=16)
+        if hasattr(model, "set_layer_taus_and_bandwidths") and str(cfg.get("gate_set","6")) == "16":
+            s_cfg = cfg.get("sigma16", {})
+            s_start = float(s_cfg.get("s_start", 0.25))
+            s_end   = float(s_cfg.get("s_end",   0.10))
+            model.set_layer_taus_and_bandwidths(taus, s_start=s_start, s_end=s_end)
+        else:
+            model.set_layer_taus(taus)
 
         opt.zero_grad()
         y_pred, dbg = model(X)
@@ -544,7 +556,13 @@ def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
             phase_scale=anneal_cfg.get("phase_scale", 0.4),
             start_frac=anneal_cfg.get("start_frac", 0.0),
         )
-        model.set_layer_taus(taus)
+        if hasattr(model, "set_layer_taus_and_bandwidths") and str(cfg.get("gate_set","6")) == "16":
+            s_cfg = cfg.get("sigma16", {})
+            s_start = float(s_cfg.get("s_start", 0.25))
+            s_end   = float(s_cfg.get("s_end",   0.10))
+            model.set_layer_taus_and_bandwidths(taus, s_start=s_start, s_end=s_end)
+        else:
+            model.set_layer_taus(taus)
 
         opt.zero_grad()
         y_pred, dbg = model(X)

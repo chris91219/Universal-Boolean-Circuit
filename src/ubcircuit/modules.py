@@ -18,20 +18,24 @@ class BooleanUnit(nn.Module):
       - gate_set = "6"  -> features in R^6 via sigma6(Rep2(x))
       - gate_set = "16" -> features in R^16 via sigma16(x)
     """
-    def __init__(self, tau: float = 0.3, gate_set: str = "6"):
+    def __init__(self, tau: float = 0.3, gate_set: str = "6", s16: float = 0.15):
         super().__init__()
         assert gate_set in {"6", "16"}
         self.gate_set = gate_set
         self.K = 16 if gate_set == "16" else 6
         self.W = nn.Parameter(1e-3 * torch.randn(self.K))
         self.tau = float(tau)
+        self.s16 = float(s16)
+
+    def set_sigma16_bandwidth(self, s: float) -> None:
+        self.s16 = float(s)
 
     def set_tau(self, tau: float) -> None:
         self.tau = float(tau)
 
     def forward(self, x2: torch.Tensor) -> torch.Tensor:
         if self.gate_set == "16":
-            feats = sigma16(x2)                                # (B,16)  smooth in x
+            feats = sigma16(x2, s=self.s16)                    # (B,16)  smooth in x
         else:
             feats = sigma6(Rep2(x2))                           # (B,6)   piecewise-smooth
         p = F.softmax(self.W / max(self.tau, 1e-8), dim=0)     # (K,)
@@ -77,19 +81,39 @@ class PairSelector(nn.Module):
         # Left pick (standard)
         PL = F.softmax(self.PL / temp, dim=-1)                 # (S,B)
 
+        # --- HARD MASK to avoid doubled edges ---
+        left_idx = PL.argmax(dim=-1)            # (S,)
+        mask = torch.full_like(self.PR, 0.0)    # (S,B)
+        mask.scatter_(1, left_idx.view(-1,1), float('-inf'))  # -inf at PL argmax per row
+
         # Right pick: repulsive by default
         if self.repel:
             if self.repel_mode == "log":
                 # log-space bias: logits_R + eta * log(1 - pL)
-                gate = torch.log(clamp01(1.0 - PL))            # (S,B)
-                adj_logits = self.PR / temp + self.repel_eta * gate
+                # gate = torch.log(clamp01(1.0 - PL))            # (S,B)
+                # adj_logits = self.PR / temp + self.repel_eta * gate
+                # PR = F.softmax(adj_logits, dim=-1)
+
+                # Add hard mask to avoid exact duplicates
+                gate = torch.log(clamp01(1.0 - PL))
+                adj_logits = (self.PR / temp) + self.repel_eta * gate + mask
                 PR = F.softmax(adj_logits, dim=-1)
+
             else:  # "mul" 
                 # Prob-space multiplicative gate 
-                w2 = F.softmax(self.PR / temp, dim=-1)     # interpret PR as logits -> probs
-                gate = (1.0 - PL)                          # (S,B)
-                pR_unnorm = self.repel_eta * gate * w2     # elementwise
-                pR = pR_unnorm / pR_unnorm.sum(dim=-1, keepdim=True)
+                # w2 = F.softmax(self.PR / temp, dim=-1)     # interpret PR as logits -> probs
+                # gate = (1.0 - PL)                          # (S,B)
+                # pR_unnorm = self.repel_eta * gate * w2     # elementwise
+                # pR = pR_unnorm / pR_unnorm.sum(dim=-1, keepdim=True)
+
+                # Add hard mask to avoid exact duplicates
+                w2 = F.softmax(self.PR / temp, dim=-1)
+                gate = (1.0 - PL)
+                pR_unnorm = self.repel_eta * gate * w2
+                # zero out the masked column:
+                pR_unnorm.scatter_(1, left_idx.view(-1,1), 0.0)
+                PR = pR_unnorm / pR_unnorm.sum(dim=-1, keepdim=True)
+
         else:
             PR = F.softmax(self.PR / temp, dim=-1)             # (S,B)
 
@@ -241,6 +265,19 @@ class DepthStack(nn.Module):
             raise ValueError(f"Expected {len(self.layers)} taus, got {len(taus)}")
         for lyr, t in zip(self.layers, taus):
             lyr.set_tau(float(t))
+
+    def set_layer_taus_and_bandwidths(self, taus: List[float], s_start=0.25, s_end=0.10):
+        assert len(taus) == len(self.layers)
+        for li, lyr in enumerate(self.layers):
+            lyr.set_tau(taus[li])
+            # linear interp bandwidth
+            s = s_start + (s_end - s_start) * (li / max(1, len(self.layers)-1))
+            # apply if 16
+            if hasattr(lyr, "units"):
+                for u in lyr.units:
+                    if getattr(u, "gate_set", "6") == "16":
+                        u.set_sigma16_bandwidth(s)
+
 
     def forward(self, xB: torch.Tensor):
         dbg_list = []

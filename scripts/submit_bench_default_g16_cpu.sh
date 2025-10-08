@@ -64,12 +64,12 @@ pair:
   mode: "log"   # or "mul" if you prefer the prob-space variant
   eta: 1.0
 # Optional: tune anneal/reg if desired
-# anneal:
-#   T0: 0.35
-#   Tmin: 0.12
-#   direction: "top_down"
-#   schedule: "linear"
-#   phase_scale: 0.4
+  anneal:
+    T0: 0.55
+    Tmin: 0.06
+    direction: "top_down"
+    schedule: "consine"
+    phase_scale: 0.5
 # regs:
 #   lam_entropy: 1.0e-3
 #   lam_div_units: 5.0e-4

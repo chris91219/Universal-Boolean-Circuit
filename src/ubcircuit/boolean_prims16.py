@@ -32,6 +32,11 @@ PRIMS16: List[str] = [
     "NOR", "XNOR", "~B", "A|~B", "~A", "~A|B", "NAND", "TRUE"
 ]
 
+_S16_BANDWIDTH = 0.15
+def set_sigma16_bandwidth(s: float) -> None:
+    global _S16_BANDWIDTH
+    _S16_BANDWIDTH = float(s)
+
 # Smooth bump φ(x; μ, s) = exp(-||x-μ||^2 / (2 s^2)), centers μ in {(0,0),(0,1),(1,0),(1,1)}.
 # s is a small bandwidth (default 0.15) to keep outputs sharp near Boolean corners.
 def _rbf(x: torch.Tensor, mu: torch.Tensor, s: float) -> torch.Tensor:
@@ -52,6 +57,8 @@ def sigma16(x2: torch.Tensor, s: float = 0.15) -> torch.Tensor:
     Returns:
         feats: (B,16) where feats[b,i] ≈ g_i(x_b) near corners and is C^∞ in x.
     """
+    s = _S16_BANDWIDTH if s is None else float(s)
+    
     if x2.dim() != 2 or x2.size(-1) != 2:
         raise ValueError(f"sigma16 expects (B,2), got {tuple(x2.shape)}")
     device = x2.device

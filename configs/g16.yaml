@@ -1,1 +1,16 @@
+seed: 1234
 gate_set: "16"
+steps: 2000
+anneal:
+  T0: 0.60
+  Tmin: 0.06
+  direction: "top_down"
+  schedule: "cosine"
+  phase_scale: 0.5
+sigma16:
+  s_start: 0.25
+  s_end: 0.10
+pair:
+  repel: true
+  mode: "log"
+  eta: 2.0

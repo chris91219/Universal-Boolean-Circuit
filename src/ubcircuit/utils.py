@@ -169,6 +169,22 @@ def make_async_taus(
         taus.append(t)
     return taus
 
+def const_gate_penalty_16(unitWs, tau: float, li: int, L_total: int, lam_const: float = 1e-3) -> torch.Tensor:
+    """
+    Penalize picking constant gates (indices 0 and 15 in 16-gate head) on non-final layers.
+    unitWs: list of W tensors for units in this layer.
+    li: current layer index (0-based), L_total: total #layers in the stack.
+    """
+    if li == L_total - 1:  # allow constants on final layer
+        return torch.zeros((), device=unitWs[0].device)
+    pen = torch.zeros((), device=unitWs[0].device)
+    for W in unitWs:
+        if W.numel() == 16:  # only for 16-gate head
+            p = F.softmax(W / max(tau, 1e-8), dim=0)
+            pen = pen + (p[0] + p[15])  # FALSE + TRUE
+    return lam_const * pen
+
+
 
 # ---------------------------
 # Regularizer bundle (easy to plug into training)
@@ -207,5 +223,8 @@ def regularizers_bundle(
         # Diversity across row mixtures (avoid both wires selecting the same unit)
         if lam_div_rows != 0.0 and L_rows.shape[0] > 1:
             reg = reg + lam_div_rows * row_diversity_penalty(L_rows)
+        
+        # NEW: constant-gate penalty for 16-way heads (non-final layers)
+        reg = reg + const_gate_penalty_16(unitWs, tau_l, li, len(dbg), lam_const=1.0e-3)
 
     return reg
