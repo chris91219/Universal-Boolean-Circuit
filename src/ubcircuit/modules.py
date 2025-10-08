@@ -7,34 +7,36 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .boolean_prims import Rep2, sigma
+from .boolean_prims import Rep2, sigma as sigma6
+from .boolean_prims16 import sigma16
 from .utils import clamp01
 
 
 class BooleanUnit(nn.Module):
     """
-    One probabilistic Boolean primitive mixer:
-        p = softmax(W / tau) in R^6
-        y = <p, sigma(Rep2(x2))>
+    Probabilistic Boolean primitive mixer.
+      - gate_set = "6"  -> features in R^6 via sigma6(Rep2(x))
+      - gate_set = "16" -> features in R^16 via sigma16(x)
     """
-    def __init__(self, tau: float = 0.3):
+    def __init__(self, tau: float = 0.3, gate_set: str = "6"):
         super().__init__()
-        self.W = nn.Parameter(1e-3 * torch.randn(6))
+        assert gate_set in {"6", "16"}
+        self.gate_set = gate_set
+        self.K = 16 if gate_set == "16" else 6
+        self.W = nn.Parameter(1e-3 * torch.randn(self.K))
         self.tau = float(tau)
 
     def set_tau(self, tau: float) -> None:
         self.tau = float(tau)
 
     def forward(self, x2: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x2: (BATCH,2) tensor (continuous relaxations in [0,1] are fine)
-        Returns:
-            y: (BATCH,1)
-        """
-        feats = sigma(Rep2(x2))                               # (B,6)
-        p = F.softmax(self.W / max(self.tau, 1e-8), dim=0)    # (6,)
-        return torch.sum(feats * p, dim=-1, keepdim=True)     # (B,1)
+        if self.gate_set == "16":
+            feats = sigma16(x2)                                # (B,16)  smooth in x
+        else:
+            feats = sigma6(Rep2(x2))                           # (B,6)   piecewise-smooth
+        p = F.softmax(self.W / max(self.tau, 1e-8), dim=0)     # (K,)
+        return torch.sum(feats * p, dim=-1, keepdim=True)      # (B,1)
+
 
 
 class PairSelector(nn.Module):
@@ -102,11 +104,12 @@ class ReasoningLayer(nn.Module):
     - outs: (BATCH,S) are unit outputs.
     - WL: (out_bits, S) with row-softmax to mix S units into each next-bit wire.
     """
-    def __init__(self, S: int = 2, out_bits: int = 2, tau: float = 0.3):
+    def __init__(self, S: int = 2, out_bits: int = 2, tau: float = 0.3, gate_set: str = "6"):
         super().__init__()
         if S < 1 or out_bits < 1:
             raise ValueError("S and out_bits must be >= 1")
-        self.units = nn.ModuleList([BooleanUnit(tau=tau) for _ in range(S)])
+        self.units = nn.ModuleList([BooleanUnit(tau=tau, gate_set=gate_set) for _ in range(S)])
+        self.gate_set = gate_set
         self.WL = nn.Parameter(1e-3 * torch.randn(out_bits, S))  # row-softmax over S
         self.tau = float(tau)
         self.out_bits = int(out_bits)
@@ -142,13 +145,14 @@ class GeneralLayer(nn.Module):
       Output mixed into out_bits via row-softmax WL.
     """
     def __init__(self, in_bits: int, S: int, out_bits: int, tau: float = 0.3,
-                 pair: dict | None = None):
+                 pair: dict | None = None, gate_set: str = "6"):
         super().__init__()
         self.in_bits = int(in_bits)
         self.S = int(S)
         self.out_bits = int(out_bits)
         self.tau = float(tau)
-        self.units = nn.ModuleList([BooleanUnit(tau=tau) for _ in range(S)])
+        self.units = nn.ModuleList([BooleanUnit(tau=tau, gate_set=gate_set) for _ in range(S)])
+        self.gate_set = gate_set
         self.WL = nn.Parameter(1e-3 * torch.randn(out_bits, S))
         if in_bits > 2:
             pair = pair or {}
@@ -213,19 +217,21 @@ class DepthStack(nn.Module):
     final ReasoningLayer(2->1).
     """
     def __init__(self, B: int, L: int = 2, S: int = 2, tau: float = 0.3,
-                 pair: dict | None = None):
+                 pair: dict | None = None, gate_set: str = "6"):
         super().__init__()
         if L < 1:
             raise ValueError("L must be >= 1")
         self.layers = nn.ModuleList([])
-        # First layer maps B -> 2 bits        
-        self.layers.append(GeneralLayer(in_bits=B, S=S, out_bits=2, tau=tau, pair=pair))
+        # First layer maps B -> 2 bits  
+        self.layers.append(GeneralLayer(in_bits=B, S=S, out_bits=2, tau=tau, pair=pair, gate_set=gate_set))
         # Middle (L-2) keep 2 -> 2
         for _ in range(max(L - 2, 0)):
-            self.layers.append(ReasoningLayer(S=S, out_bits=2, tau=tau))
+            self.layers.append(ReasoningLayer(S=S, out_bits=2, tau=tau, gate_set=gate_set))
         # Final 2 -> 1
         if L >= 2:
-            self.layers.append(ReasoningLayer(S=S, out_bits=1, tau=tau))
+            self.layers.append(ReasoningLayer(S=S, out_bits=1, tau=tau, gate_set=gate_set))
+        self.gate_set = gate_set
+        
         self.tau = float(tau)
         self.L = int(L)
         self.B = int(B)

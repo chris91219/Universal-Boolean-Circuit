@@ -18,6 +18,7 @@ DEFAULT_CFG: Dict[str, Any] = {
     "task": "(a&b)|(~a)",   # single-task fallback
     "L": 2,
     "S": 2,
+    "gate_set": "6",   # "6" (legacy) or "16" (compact)
     "steps": 1200,
     "lr": 0.05,
     "optimizer": "rmsprop",
@@ -172,21 +173,52 @@ def expr_complexity(expr: str) -> Tuple[int, int]:
 
 # ---------- Layer-by-layer composed symbolic readout ----------
 
+# def _apply_prim_to_syms(prim: str, a_sym: str, b_sym: str) -> str:
+#     # No extra parens around single literals inside &, |; group the whole binary op.
+#     if prim.startswith("AND"):       # "AND(a,b)=min"
+#         return f"({a_sym} & {b_sym})"
+#     if prim.startswith("OR"):        # "OR(a,b)=max"
+#         return f"({a_sym} | {b_sym})"
+#     if prim.startswith("NOT(a)"):
+#         return f"(1 - {a_sym})"
+#     if prim.startswith("NOT(b)"):
+#         return f"(1 - {b_sym})"
+#     if prim.startswith("a (skip)"):
+#         return f"{a_sym}"
+#     if prim.startswith("b (skip)"):
+#         return f"{b_sym}"
+#     return f"({a_sym} | {b_sym})"  # fallback
+
 def _apply_prim_to_syms(prim: str, a_sym: str, b_sym: str) -> str:
-    # No extra parens around single literals inside &, |; group the whole binary op.
-    if prim.startswith("AND"):       # "AND(a,b)=min"
-        return f"({a_sym} & {b_sym})"
-    if prim.startswith("OR"):        # "OR(a,b)=max"
-        return f"({a_sym} | {b_sym})"
-    if prim.startswith("NOT(a)"):
-        return f"(1 - {a_sym})"
-    if prim.startswith("NOT(b)"):
-        return f"(1 - {b_sym})"
-    if prim.startswith("a (skip)"):
-        return f"{a_sym}"
-    if prim.startswith("b (skip)"):
-        return f"{b_sym}"
-    return f"({a_sym} | {b_sym})"  # fallback
+    # ---- legacy 6 features
+    if prim.startswith("AND"):        return f"({a_sym} & {b_sym})"
+    if prim.startswith("OR("):        return f"({a_sym} | {b_sym})"
+    if prim.startswith("NOT(a)"):     return f"(1 - {a_sym})"
+    if prim.startswith("NOT(b)"):     return f"(1 - {b_sym})"
+    if prim.startswith("a (skip)"):   return f"{a_sym}"
+    if prim.startswith("b (skip)"):   return f"{b_sym}"
+
+    # ---- 16-gate names
+    if prim == "FALSE":    return "0"
+    if prim == "TRUE":     return "1"
+    if prim == "A":        return f"{a_sym}"
+    if prim == "B":        return f"{b_sym}"
+    if prim == "~A":       return f"(1 - {a_sym})"
+    if prim == "~B":       return f"(1 - {b_sym})"
+    if prim == "AND":      return f"({a_sym} & {b_sym})"
+    if prim == "OR":       return f"({a_sym} | {b_sym})"
+    if prim == "XOR":      return f"(({a_sym} & (1 - {b_sym})) | ((1 - {a_sym}) & {b_sym}))"
+    if prim == "XNOR":     return f"(1 - (({a_sym} & (1 - {b_sym})) | ((1 - {a_sym}) & {b_sym})))"
+    if prim == "NAND":     return f"(1 - ({a_sym} & {b_sym}))"
+    if prim == "NOR":      return f"(1 - ({a_sym} | {b_sym}))"
+    if prim == "A&~B":     return f"({a_sym} & (1 - {b_sym}))"
+    if prim == "~A&B":     return f"((1 - {a_sym}) & {b_sym})"
+    if prim == "A|~B":     return f"({a_sym} | (1 - {b_sym}))"
+    if prim == "~A|B":     return f"((1 - {a_sym}) | {b_sym})"
+
+    # Fallback
+    return f"({a_sym} | {b_sym})"
+
 
 def _argmax_unit_primitive(unitW: torch.Tensor, tau: float, PRIMS: List[str]) -> str:
     p = torch.softmax(unitW / max(tau, 1e-8), dim=0)
@@ -260,7 +292,7 @@ def train_single_instance(
     inst: Dict[str, Any],
     L_override: Optional[int] = None,
 ) -> Dict[str, Any]:
-    from .boolean_prims import PRIMS as PRIMS_LIST
+    #from .boolean_prims import PRIMS as PRIMS_LIST
 
     B = int(inst["B"]); S = int(inst["S"]); formula = str(inst["formula"])
     X, y_true = T.truth_table_from_formula(B, formula)
@@ -275,7 +307,17 @@ def train_single_instance(
         L_used = int(cfg["L"])
 
     T0 = float(cfg["anneal"]["T0"])    
-    model = DepthStack(B=B, L=L_used, S=S, tau=T0, pair=cfg.get("pair", None)).to(device)
+    gate_set = str(cfg.get("gate_set", "6"))
+    if gate_set == "16":
+        from .boolean_prims16 import PRIMS16 as PRIMS_LIST
+    else:
+        from .boolean_prims import PRIMS as PRIMS_LIST
+
+    model = DepthStack(B=B, L=L_used, S=S, tau=T0,
+                    pair=cfg.get("pair", None),
+                    gate_set=gate_set).to(device)
+
+    #model = DepthStack(B=B, L=L_used, S=S, tau=T0, pair=cfg.get("pair", None)).to(device)
 
     opt_name = str(cfg["optimizer"]).lower()
     opt = (optim.RMSprop(model.parameters(), lr=cfg["lr"], alpha=0.99, eps=1e-8)
@@ -483,7 +525,11 @@ def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
     X = X.to(device); y_true = y_true.to(device)
 
     L, S = int(cfg["L"]), int(cfg["S"])    
-    model = DepthStack(B=2, L=L, S=S, tau=cfg["anneal"]["T0"], pair=cfg.get("pair", None)).to(device)
+    #model = DepthStack(B=2, L=L, S=S, tau=cfg["anneal"]["T0"], pair=cfg.get("pair", None)).to(device)
+    model = DepthStack(B=2, L=L, S=S, tau=cfg["anneal"]["T0"],
+                   pair=cfg.get("pair", None),
+                   gate_set=str(cfg.get("gate_set","6"))).to(device)
+
     opt = (optim.RMSprop(model.parameters(), lr=cfg["lr"], alpha=0.99, eps=1e-8)
            if cfg["optimizer"].lower() == "rmsprop" else
            optim.Adam(model.parameters(), lr=cfg["lr"]))
