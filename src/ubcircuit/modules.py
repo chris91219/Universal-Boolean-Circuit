@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from .boolean_prims import Rep2, sigma as sigma6
 from .boolean_prims16 import sigma16
+from .fixed_selector import FixedPairSelector
 from .utils import clamp01
 
 
@@ -49,7 +50,10 @@ class PairSelector(nn.Module):
     Two row-softmax matrices: PL, PR in R^{S x B}.
     """
     def __init__(self, B: int, S: int, tau: float = 0.3,
-                 repel: bool = True, repel_eta: float = 1.0, repel_mode: str = "log"):
+                 repel: bool = True, repel_eta: float = 1.0, repel_mode: str = "hard-log",
+                 PL_prior: torch.Tensor | None = None,
+                 PR_prior: torch.Tensor | None = None,
+                 prior_strength: float = 0.0):
         super().__init__()
         self.PL = nn.Parameter(1e-3 * torch.randn(S, B))
         self.PR = nn.Parameter(1e-3 * torch.randn(S, B))
@@ -58,14 +62,25 @@ class PairSelector(nn.Module):
         self.tau = float(tau)
         self.repel = bool(repel)
         self.repel_eta = float(repel_eta)
-        assert repel_mode in {"log", "mul"}
+        assert repel_mode in {"log", "mul", "hard-log", "hard-mul"}
         self.repel_mode = repel_mode
+        self.prior_strength = float(prior_strength)
+        if PL_prior is not None:
+            assert PL_prior.shape == (S, B)
+            self.register_buffer("PL_prior", PL_prior)
+        else:
+            self.PL_prior = None
+        if PR_prior is not None:
+            assert PR_prior.shape == (S, B)
+            self.register_buffer("PR_prior", PR_prior)
+        else:
+            self.PR_prior = None
 
     def set_repulsion(self, repel: bool = None, eta: float = None, mode: str = None):
         if repel is not None: self.repel = bool(repel)
         if eta   is not None: self.repel_eta = float(eta)
         if mode  is not None:
-            assert mode in {"log", "mul"}
+            assert mode in {"log", "mul", "hard-log", "hard-mul"}
             self.repel_mode = mode
 
 
@@ -74,52 +89,71 @@ class PairSelector(nn.Module):
 
     def forward(self, xB: torch.Tensor) -> torch.Tensor:
         """
-         xB: (BATCH, B)
-         returns pairs2: (BATCH, S, 2) with pairs2[:, s, 0]=a_s, pairs2[:, s, 1]=b_s
-        """        
+        xB: (BATCH, B)
+        returns pairs2: (BATCH, S, 2) with pairs2[:, s, 0]=a_s, pairs2[:, s, 1]=b_s
+        """
         temp = max(self.tau, 1e-8)
-        # Left pick (standard)
-        PL = F.softmax(self.PL / temp, dim=-1)                 # (S,B)
 
-        # --- HARD MASK to avoid doubled edges ---
-        left_idx = PL.argmax(dim=-1)            # (S,)
-        mask = torch.full_like(self.PR, 0.0)    # (S,B)
-        mask.scatter_(1, left_idx.view(-1,1), float('-inf'))  # -inf at PL argmax per row
+        # -------- Left pick: PL (row-softmax over B inputs) --------
+        PL_logits = self.PL / temp
+        # (optional) soft MI prior in log-space
+        if getattr(self, "PL_prior", None) is not None and self.prior_strength > 0.0:
+            PL_logits = PL_logits + self.prior_strength * torch.log(clamp01(self.PL_prior))
+        PL = F.softmax(PL_logits, dim=-1)                               # (S,B)
 
-        # Right pick: repulsive by default
+        # Indices + masks used by "hard-*" modes to forbid doubled edges
+        left_idx = PL.argmax(dim=-1)                                    # (S,)
+        mask_logit = torch.full_like(self.PR, 0.0)                      # (S,B)
+        mask_logit.scatter_(1, left_idx.view(-1,1), float('-inf'))      # for log-space
+        mask_prob = torch.zeros_like(self.PR)                           # (S,B)
+        mask_prob.scatter_(1, left_idx.view(-1,1), 1.0)                 # for prob-space zeroing
+
+        # -------- Right pick: PR --------
         if self.repel:
-            if self.repel_mode == "log":
-                # log-space bias: logits_R + eta * log(1 - pL)
-                # gate = torch.log(clamp01(1.0 - PL))            # (S,B)
-                # adj_logits = self.PR / temp + self.repel_eta * gate
-                # PR = F.softmax(adj_logits, dim=-1)
+            mode = self.repel_mode
+            if mode in {"log", "hard-log"}:
+                # log-space repulsion against PL: add eta * log(1 - PL)
+                gate = torch.log(clamp01(1.0 - PL))                     # (S,B)
+                PR_logits = (self.PR / temp) + self.repel_eta * gate
 
-                # Add hard mask to avoid exact duplicates
-                gate = torch.log(clamp01(1.0 - PL))
-                adj_logits = (self.PR / temp) + self.repel_eta * gate + mask
-                PR = F.softmax(adj_logits, dim=-1)
+                # (optional) soft MI prior in log-space
+                if getattr(self, "PR_prior", None) is not None and self.prior_strength > 0.0:
+                    PR_logits = PR_logits + self.prior_strength * torch.log(clamp01(self.PR_prior))
 
-            else:  # "mul" 
-                # Prob-space multiplicative gate 
-                # w2 = F.softmax(self.PR / temp, dim=-1)     # interpret PR as logits -> probs
-                # gate = (1.0 - PL)                          # (S,B)
-                # pR_unnorm = self.repel_eta * gate * w2     # elementwise
-                # pR = pR_unnorm / pR_unnorm.sum(dim=-1, keepdim=True)
+                # hard mask only in "hard-log"
+                if mode == "hard-log":
+                    PR_logits = PR_logits + mask_logit
 
-                # Add hard mask to avoid exact duplicates
-                w2 = F.softmax(self.PR / temp, dim=-1)
-                gate = (1.0 - PL)
-                pR_unnorm = self.repel_eta * gate * w2
-                # zero out the masked column:
-                pR_unnorm.scatter_(1, left_idx.view(-1,1), 0.0)
-                PR = pR_unnorm / pR_unnorm.sum(dim=-1, keepdim=True)
+                PR = F.softmax(PR_logits, dim=-1)                       # (S,B)
 
+            elif mode in {"mul", "hard-mul"}:
+                # prob-space repulsion: scale probs by (1 - PL)
+                w2 = F.softmax(self.PR / temp, dim=-1)                  # (S,B)
+                # (optional) soft MI prior in prob-space
+                if getattr(self, "PR_prior", None) is not None and self.prior_strength > 0.0:
+                    # raise prior to strength, then renorm later
+                    w2 = w2 * (clamp01(self.PR_prior) ** self.prior_strength)
+
+                gate = (1.0 - PL)                                       # (S,B)
+                pR_unnorm = self.repel_eta * gate * w2                  # (S,B)
+
+                if mode == "hard-mul":
+                    # zero the PL argmax column
+                    pR_unnorm = pR_unnorm * (1.0 - mask_prob)
+
+                PR = pR_unnorm / pR_unnorm.sum(dim=-1, keepdim=True)    # (S,B)
+
+            else:
+                # should not happen (assert in __init__), but keep a safe fallback
+                PR = F.softmax(self.PR / temp, dim=-1)
         else:
-            PR = F.softmax(self.PR / temp, dim=-1)             # (S,B)
+            PR = F.softmax(self.PR / temp, dim=-1)
 
-        a = xB @ PL.t()                                        # (batch,S)
-        b = xB @ PR.t()                                        # (batch,S)
-        return torch.stack([a, b], dim=-1)                     # (batch,S,2)
+        # -------- Gather pairs and return --------
+        a = xB @ PL.t()                                                 # (batch,S)
+        b = xB @ PR.t()                                                 # (batch,S)
+        return torch.stack([a, b], dim=-1)                              # (batch,S,2)
+
 
 
 class ReasoningLayer(nn.Module):
@@ -180,12 +214,28 @@ class GeneralLayer(nn.Module):
         self.WL = nn.Parameter(1e-3 * torch.randn(out_bits, S))
         if in_bits > 2:
             pair = pair or {}
-            self.selector = PairSelector(
-                B=in_bits, S=S, tau=tau,
-                repel=pair.get("repel", True),
-                repel_eta=pair.get("eta", 1.0),
-                repel_mode=pair.get("mode", "log"),
-            )
+            route = pair.get("route", "learned")
+            if route == "mi_hard" and ("fixed_pairs" in pair):
+                self.selector = FixedPairSelector(B=in_bits, pairs=pair["fixed_pairs"])
+            elif route == "mi_soft" and ("PL_prior" in pair) and ("PR_prior" in pair):
+                PLp = torch.tensor(pair["PL_prior"], dtype=torch.float32)
+                PRp = torch.tensor(pair["PR_prior"], dtype=torch.float32)
+                self.selector = PairSelector(
+                    B=in_bits, S=S, tau=tau,
+                    repel=pair.get("repel", True),
+                    repel_eta=pair.get("eta", 1.0),
+                    repel_mode=pair.get("mode", "hard-log"),
+                    PL_prior=PLp, PR_prior=PRp,
+                    prior_strength=float(pair.get("prior_strength", 2.0)),
+                )
+            else:
+                # default learned
+                self.selector = PairSelector(
+                    B=in_bits, S=S, tau=tau,
+                    repel=pair.get("repel", True),
+                    repel_eta=pair.get("eta", 1.0),
+                    repel_mode=pair.get("mode", "hard-log"),
+                )
         else:
             self.selector = None
 
@@ -209,29 +259,67 @@ class GeneralLayer(nn.Module):
         next_bits = [(outs * L_rows[k]).sum(-1, keepdim=True) for k in range(self.out_bits)]
         x_next = torch.cat(next_bits, dim=-1)                        # (B,out_bits)
         unitWs = [u.W for u in self.units]
+
+
+        temp = max(self.tau, 1e-8)
+        PL_dbg = F.softmax(self.selector.PL / temp, dim=-1) if self.selector is not None else None
+        if self.selector is None:
+            PR_dbg = None
+        elif not self.selector.repel:
+            PR_dbg = F.softmax(self.selector.PR / temp, dim=-1)
+        else:
+            mode = self.selector.repel_mode
+            if mode in {"log", "hard-log"}:
+                gate = torch.log(clamp01(1.0 - PL_dbg))
+                PR_logits = (self.selector.PR / temp) + self.selector.repel_eta * gate
+                if mode == "hard-log":
+                    left_idx_dbg = PL_dbg.argmax(dim=-1)
+                    mask_logit_dbg = torch.full_like(self.selector.PR, 0.0)
+                    mask_logit_dbg.scatter_(1, left_idx_dbg.view(-1,1), float('-inf'))
+                    PR_logits = PR_logits + mask_logit_dbg
+                PR_dbg = F.softmax(PR_logits, dim=-1)
+            else:  # "mul" or "hard-mul"
+                w2 = F.softmax(self.selector.PR / temp, dim=-1)
+                gate = (1.0 - PL_dbg)
+                pR_unnorm = self.selector.repel_eta * gate * w2
+                if mode == "hard-mul":
+                    left_idx_dbg = PL_dbg.argmax(dim=-1)
+                    mask_prob_dbg = torch.zeros_like(self.selector.PR)
+                    mask_prob_dbg.scatter_(1, left_idx_dbg.view(-1,1), 1.0)
+                    pR_unnorm = pR_unnorm * (1.0 - mask_prob_dbg)
+                PR_dbg = pR_unnorm / pR_unnorm.sum(dim=-1, keepdim=True)
+
         dbg = {
             "outs": outs,
             "L_rows": L_rows,
             "unitWs": unitWs,
-            "PL": (
-                F.softmax(self.selector.PL / max(self.tau, 1e-8), dim=-1)
-                if self.selector is not None else None
-            ),
-            "PR": (
-                F.softmax(
-                    self.selector.PR / max(self.tau, 1e-8)
-                    + self.selector.repel_eta * torch.log(
-                        clamp01(1.0 - F.softmax(self.selector.PL / max(self.tau, 1e-8), dim=-1))
-                    ),
-                    dim=-1,
-                )
-                if (self.selector is not None and self.selector.repel and self.selector.repel_mode == "log")
-                else (
-                    F.softmax(self.selector.PR / max(self.tau, 1e-8), dim=-1)
-                    if self.selector is not None else None
-                )
-            ),
+            "PL": PL_dbg,
+            "PR": PR_dbg,
         }
+
+        # dbg = {
+        #     "outs": outs,
+        #     "L_rows": L_rows,
+        #     "unitWs": unitWs,
+        #     "PL": (
+        #         F.softmax(self.selector.PL / max(self.tau, 1e-8), dim=-1)
+        #         if self.selector is not None else None
+        #     ),
+        #     "PR": (
+        #         F.softmax(
+        #             self.selector.PR / max(self.tau, 1e-8)
+        #             + self.selector.repel_eta * torch.log(
+        #                 clamp01(1.0 - F.softmax(self.selector.PL / max(self.tau, 1e-8), dim=-1))
+        #             ),
+        #             dim=-1,
+        #         )
+        #         if (self.selector is not None and self.selector.repel and self.selector.repel_mode == "log")
+        #         else (
+        #             F.softmax(self.selector.PR / max(self.tau, 1e-8), dim=-1)
+        #             if self.selector is not None else None
+        #         )
+        #     ),
+        # }
         return x_next, dbg
 
 

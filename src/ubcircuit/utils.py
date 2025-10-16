@@ -196,6 +196,7 @@ def regularizers_bundle(
     lam_entropy: float = 1e-3,
     lam_div_units: float = 5e-4,
     lam_div_rows: float = 5e-4,
+    lam_const16: float = 1e-3,
 ) -> torch.Tensor:
     """
     Compute summed regularizer given per-layer diagnostics.
@@ -225,6 +226,6 @@ def regularizers_bundle(
             reg = reg + lam_div_rows * row_diversity_penalty(L_rows)
         
         # NEW: constant-gate penalty for 16-way heads (non-final layers)
-        reg = reg + const_gate_penalty_16(unitWs, tau_l, li, len(dbg), lam_const=1.0e-3)
+        reg = reg + const_gate_penalty_16(unitWs, tau_l, li, len(dbg), lam_const=lam_const16)
 
     return reg

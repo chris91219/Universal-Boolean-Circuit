@@ -13,6 +13,7 @@ from .modules import DepthStack
 from .utils import seed_all, safe_bce, make_async_taus, regularizers_bundle
 from . import tasks as T
 from .boolean_prims16 import set_sigma16_bandwidth
+from .mi import top_mi_pairs, priors_from_pairs
 
 
 DEFAULT_CFG: Dict[str, Any] = {
@@ -39,8 +40,13 @@ DEFAULT_CFG: Dict[str, Any] = {
         "phase_scale": 0.4,
         "start_frac": 0.0
     },
-    "regs": {"lam_entropy": 1.0e-3, "lam_div_units": 5.0e-4, "lam_div_rows": 5.0e-4},
-    "pair": {"repel": True, "eta": 1.0, "mode": "log"},  # right-pick repulsion
+    "regs": {"lam_entropy": 1.0e-3, "lam_div_units": 5.0e-4, "lam_div_rows": 5.0e-4,"lam_const16": 5.0e-3},
+    "pair": {
+                "repel": True,                 
+                "eta": 1.0, 
+                "mode": "hard-log",   # right-pick repulsion 
+                "route": "learned",   # NEW: "learned" | "mi_soft" | "mi_hard"
+            },  
     "aux": {"use": False, "lam": 1.0e-2, "wire_targets": ["AND", "NOTA"]},
     "dataset": None,  # path to JSONL with rows like {"B":int,"S":int,"L":int,"formula":str}
     "early_stop": {
@@ -300,10 +306,10 @@ def train_single_instance(
     #from .boolean_prims import PRIMS as PRIMS_LIST
 
     B = int(inst["B"]); S = int(inst["S"]); formula = str(inst["formula"])
-    X, y_true = T.truth_table_from_formula(B, formula)
+    X, y_true = T.truth_table_from_formula(B, formula)    
     X = X.to(device); y_true = y_true.to(device)
 
-    # Resolve L per instance
+    # ---- Resolve L, temps, gate set ----
     if L_override is not None:
         L_used = int(L_override)
     elif bool(cfg.get("use_row_L", True)) and ("L" in inst):
@@ -311,18 +317,33 @@ def train_single_instance(
     else:
         L_used = int(cfg["L"])
 
-    T0 = float(cfg["anneal"]["T0"])    
+    anneal_cfg = cfg["anneal"]
+    T0 = float(anneal_cfg["T0"])
     gate_set = str(cfg.get("gate_set", "6"))
     if gate_set == "16":
         from .boolean_prims16 import PRIMS16 as PRIMS_LIST
     else:
         from .boolean_prims import PRIMS as PRIMS_LIST
 
+    # ---- Pair config with routing modes: learned | mi_soft | mi_hard ----
+    pair_cfg = dict(cfg.get("pair", {}))  # copy
+    route = str(pair_cfg.get("route", "learned"))
+    if (B > 2) and route in {"mi_soft", "mi_hard"}:
+        from .mi import top_mi_pairs, priors_from_pairs
+        pairs = top_mi_pairs(X, y_true, S=S, disjoint=bool(pair_cfg.get("mi_disjoint", True)))
+        if route == "mi_hard":
+            pair_cfg["fixed_pairs"] = pairs                           # for FixedPairSelector in GeneralLayer
+        else:  # mi_soft
+            PLp, PRp = priors_from_pairs(pairs, B)
+            pair_cfg["PL_prior"] = PLp.tolist()
+            pair_cfg["PR_prior"] = PRp.tolist()
+            # pair_cfg["prior_strength"] can be set in YAML (default e.g. 2.0)
+
+    # ---- Build model with the (possibly) augmented pair_cfg ----
     model = DepthStack(B=B, L=L_used, S=S, tau=T0,
-                    pair=cfg.get("pair", None),
+                    pair=pair_cfg,
                     gate_set=gate_set).to(device)
 
-    #model = DepthStack(B=B, L=L_used, S=S, tau=T0, pair=cfg.get("pair", None)).to(device)
 
     opt_name = str(cfg["optimizer"]).lower()
     opt = (optim.RMSprop(model.parameters(), lr=cfg["lr"], alpha=0.99, eps=1e-8)
@@ -371,6 +392,7 @@ def train_single_instance(
             lam_entropy=regs_cfg["lam_entropy"],
             lam_div_units=regs_cfg["lam_div_units"],
             lam_div_rows=regs_cfg["lam_div_rows"],
+            lam_const16=regs_cfg.get("lam_const16", 1.0e-3),
         )
         (loss + reg).backward()
         opt.step()
@@ -575,6 +597,7 @@ def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
             lam_entropy=regs_cfg["lam_entropy"],
             lam_div_units=regs_cfg["lam_div_units"],
             lam_div_rows=regs_cfg["lam_div_rows"],
+            lam_const16=regs_cfg.get("lam_const16", 1.0e-3),
         )
         (loss + reg).backward()
         opt.step()
