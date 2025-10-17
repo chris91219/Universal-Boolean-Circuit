@@ -1,20 +1,13 @@
 #!/usr/bin/env python3
 """
-analyze_ubc_results.py
+analyze_ubc_results.py  (updated)
 
-Scan UBC-Results directories for run summary.json files and produce:
-  - meta_runs.csv   : per-run rows
-  - meta_groups.csv : aggregated by (folder_root, variant, mode, eta)
-  - pair_sweep_pivot_em.csv (if mode/eta present): eta x mode pivot of mean EM
-
-Usage examples:
-  python analyze_ubc_results.py \
-      ~/scratch/UBC-Results/ablations \
-      ~/scratch/UBC-Results/bench_pair_sweep
-
-  python analyze_ubc_results.py \
-      ~/scratch/UBC-Results/ablations_opt \
-      --out ~/scratch/UBC-Results/ablations_opt
+Scans UBC-Results roots for run summary.json files and produces:
+  - meta_runs.csv            : per-run rows with rich config metadata
+  - meta_groups.csv          : aggregated by (folder_root, variant, gate_set, route, repel, mode, lam_const16, eta)
+  - best_overall.csv         : single best run overall (by EM, then row_acc, then ratio_pred)
+  - best_by_setup.csv        : best run per setup (same grouping key as meta_groups)
+  - pair_sweep_pivot_em.csv  : (unchanged) eta x mode pivot of mean EM if both mode & eta exist
 
 No external deps (stdlib only).
 """
@@ -39,48 +32,64 @@ def _read_json(p: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _infer_variant_mode_eta_seed(run_dir: Path, summary: Dict[str, Any]) -> Tuple[str, Optional[str], Optional[float], Optional[int]]:
+def _infer_variant_meta(run_dir: Path, summary: Dict[str, Any]) -> Tuple[
+    str, Optional[str], Optional[float], Optional[int], Optional[str], Optional[bool], Optional[str], Optional[float]
+]:
     """
     Infer:
-      - variant: e.g., 'base', 'anneal_td', 'td_div_rows', 'bench_default', 'base_adam', ...
-      - mode:    for pair-repel sweep (e.g., 'log' or 'mul'), else None
-      - eta:     for pair-repel sweep (float), else None
-      - seed:    prefer summary['config']['seed'], fallback parse from dir name
+      - variant     : high-level folder variant ('ablations', 'bench_default', 'mi_ablation', 'repel_const_ablation', ...)
+      - mode        : pair repulsion mode ('log', 'mul', 'hard-log', 'hard-mul') or None
+      - eta         : repulsion eta (float) or None
+      - seed        : prefer summary['config']['seed'], else parse from dir name
+      - gate_set    : "6" | "16" | None
+      - repel       : bool or None
+      - route       : 'learned' | 'mi_soft' | 'mi_hard' | None
+      - lam_const16 : float or None
     """
     parts = run_dir.parts
     variant = None
     mode = None
     eta = None
     seed = None
+    gate_set = None
+    repel = None
+    route = None
+    lam_const16 = None
 
-    # Prefer seed from saved config
     cfg = summary.get("config", {})
-    if isinstance(cfg, dict) and "seed" in cfg:
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    # Seed from config preferred
+    if "seed" in cfg:
         try:
             seed = int(cfg["seed"])
         except Exception:
-            pass
+            seed = None
 
-    # Try to infer from path shape
-    # .../UBC-Results/ablations/<variant>/<timestamp>_jobXXXX_seedY/summary.json
-    if "ablations" in parts:
-        i = parts.index("ablations")
-        if i + 1 < len(parts):
-            variant = parts[i + 1]
+    # Try to infer a high-level "variant" from the path
+    for key in (
+        "ablations",
+        "ablations_opt",
+        "bench_pair_sweep",
+        "bench_default",
+        "bench_default_g16",
+        "mi_ablation",
+        "repel_const_ablation",
+        "mi_ablation_cpu",
+        "repel_const_ablation_cpu",
+    ):
+        if key in parts:
+            variant = key
+            break
+    if variant is None:
+        variant = "unknown"
 
-    # .../UBC-Results/ablations_opt/<variant>/<timestamp>_jobXXXX_seedY/summary.json
-    if variant is None and "ablations_opt" in parts:
-        i = parts.index("ablations_opt")
-        if i + 1 < len(parts):
-            variant = parts[i + 1]
-
-    # .../UBC-Results/bench_pair_sweep/<mode_etaX>/<timestamp>_job.../summary.json
+    # Parse bench_pair_sweep folder names like: log_eta0.5
     if "bench_pair_sweep" in parts:
         i = parts.index("bench_pair_sweep")
         if i + 1 < len(parts):
-            variant_folder = parts[i + 1]  # e.g., 'log_eta0.5'
-            variant = "pair_sweep"
-            m = re.match(r"(log|mul)_eta([0-9.]+)", variant_folder)
+            m = re.match(r"(log|mul)_eta([0-9.]+)", parts[i + 1])
             if m:
                 mode = m.group(1)
                 try:
@@ -88,16 +97,7 @@ def _infer_variant_mode_eta_seed(run_dir: Path, summary: Dict[str, Any]) -> Tupl
                 except Exception:
                     eta = None
 
-    # .../UBC-Results/bench_default/<timestamp>_jobXXXX_seed0/summary.json
-    if variant is None and "bench_default" in parts:
-        variant = "bench_default"
-
-    # If still None, try to get something from config
-    if variant is None:
-        # maybe it was run_single or a custom folder; fall back to 'unknown'
-        variant = "unknown"
-
-    # If seed not in config, parse from tail
+    # If seed not in config, parse from trail like *_seed7
     if seed is None:
         m = re.search(r"seed(\d+)", run_dir.name)
         if m:
@@ -106,22 +106,51 @@ def _infer_variant_mode_eta_seed(run_dir: Path, summary: Dict[str, Any]) -> Tupl
             except Exception:
                 seed = None
 
-    # Also try config.pair for mode/eta if not parsed from path
-    if mode is None or eta is None:
-        pair = cfg.get("pair", {}) if isinstance(cfg, dict) else {}
+    # Pull new fields from saved config
+    if cfg:
+        # gate_set
+        if "gate_set" in cfg:
+            try:
+                gate_set = str(cfg["gate_set"])
+            except Exception:
+                gate_set = None
+
+        # regs.lam_const16
+        regs = cfg.get("regs", {})
+        if isinstance(regs, dict) and "lam_const16" in regs:
+            try:
+                lam_const16 = float(regs["lam_const16"])
+            except Exception:
+                lam_const16 = None
+
+        # pair sub-config
+        pair = cfg.get("pair", {})
         if isinstance(pair, dict):
+            # route
+            if "route" in pair:
+                try:
+                    route = str(pair["route"])
+                except Exception:
+                    route = None
+            # repel
+            if "repel" in pair:
+                try:
+                    repel = bool(pair["repel"])
+                except Exception:
+                    repel = None
+            # mode and eta (if not deduced yet)
             if mode is None and "mode" in pair:
                 try:
                     mode = str(pair["mode"])
                 except Exception:
-                    pass
+                    mode = None
             if eta is None and "eta" in pair:
                 try:
                     eta = float(pair["eta"])
                 except Exception:
-                    pass
+                    eta = None
 
-    return variant, mode, eta, seed
+    return variant, mode, eta, seed, gate_set, repel, route, lam_const16
 
 
 def _extract_metrics(summary: Dict[str, Any], run_dir: Path) -> Dict[str, Any]:
@@ -157,14 +186,8 @@ def _extract_metrics(summary: Dict[str, Any], run_dir: Path) -> Dict[str, Any]:
         out["n_instances"] = 1
         out["avg_row_acc"] = float(summary.get("row_acc", float("nan")))
         em = summary.get("em", None)
-        if em is None:
-            out["em_rate"] = float("nan")
-        else:
-            try:
-                out["em_rate"] = float(em)
-            except Exception:
-                out["em_rate"] = float("nan")
-        out["equiv_rate"] = out["em_rate"]  # same meaning in your code
+        out["em_rate"] = float(em) if isinstance(em, (int, float)) else float("nan")
+        out["equiv_rate"] = out["em_rate"]
         out["simpler_pred"] = out["simpler_label"] = out["simpler_tie"] = out["simpler_same"] = 0
         out["ratio_pred"] = out["ratio_label"] = out["ratio_tie"] = out["ratio_same"] = 0.0
 
@@ -178,6 +201,22 @@ def _mean_std(xs: List[float]) -> Tuple[float, float]:
     m = sum(xs) / len(xs)
     var = sum((x - m) ** 2 for x in xs) / len(xs)
     return m, math.sqrt(var)
+
+
+def _score_tuple(run: Dict[str, Any]) -> Tuple[float, float, float]:
+    """
+    Ranking key for 'best' selection:
+      1) higher em_rate
+      2) then higher avg_row_acc
+      3) then higher ratio_pred (share of cases where pred simpler than label)
+    """
+    em = run.get("em_rate")
+    acc = run.get("avg_row_acc")
+    rpred = run.get("ratio_pred")
+    em = float(em) if isinstance(em, (int, float)) else float("-inf")
+    acc = float(acc) if isinstance(acc, (int, float)) else float("-inf")
+    rpred = float(rpred) if isinstance(rpred, (int, float)) else float("-inf")
+    return (em, acc, rpred)
 
 
 def main():
@@ -198,47 +237,65 @@ def main():
                 continue
             run_dir = p.parent
             folder_root = str(root)
-            variant, mode, eta, seed = _infer_variant_mode_eta_seed(run_dir, s)
+            variant, mode, eta, seed, gate_set, repel, route, lam_const16 = _infer_variant_meta(run_dir, s)
             mets = _extract_metrics(s, run_dir)
 
             row = {
                 "folder_root": folder_root,
                 "variant": variant,
+                "gate_set": gate_set,
+                "route": route,
+                "repel": repel,
                 "mode": mode,
                 "eta": eta,
+                "lam_const16": lam_const16,
                 "seed": seed,
                 "run_dir": str(run_dir),
                 **mets,
             }
             rows.append(row)
 
-    # Write per-run CSV
+    # ---------- per-run CSV ----------
     runs_csv = out_dir / "meta_runs.csv"
-    if rows:
-        fieldnames = [
-            "folder_root", "variant", "mode", "eta", "seed", "run_dir",
-            "avg_row_acc", "em_rate", "equiv_rate", "n_instances",
-            "simpler_pred", "simpler_label", "simpler_tie", "simpler_same",
-            "ratio_pred", "ratio_label", "ratio_tie", "ratio_same",
-        ]
-        with runs_csv.open("w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writeheader()
-            for r in rows:
-                w.writerow({k: r.get(k, "") for k in fieldnames})
-        print(f"[ok] Wrote per-run: {runs_csv}")
-    else:
+    if not rows:
         print("[warn] No runs found (no summary.json under given roots).")
         return
 
-    # Grouped stats by (folder_root, variant, mode, eta)
-    grouped: Dict[Tuple[str, str, Optional[str], Optional[float]], List[Dict[str, Any]]] = defaultdict(list)
+    fieldnames_runs = [
+        "folder_root", "variant", "gate_set", "route", "repel", "mode", "eta", "lam_const16",
+        "seed", "run_dir",
+        "avg_row_acc", "em_rate", "equiv_rate", "n_instances",
+        "simpler_pred", "simpler_label", "simpler_tie", "simpler_same",
+        "ratio_pred", "ratio_label", "ratio_tie", "ratio_same",
+    ]
+    with runs_csv.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames_runs)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in fieldnames_runs})
+    print(f"[ok] Wrote per-run: {runs_csv}")
+
+    # ---------- grouped CSV ----------
+    grouped: Dict[
+        Tuple[str, str, Optional[str], Optional[str], Optional[bool], Optional[str], Optional[float], Optional[float]],
+        List[Dict[str, Any]]
+    ] = defaultdict(list)
     for r in rows:
-        key = (r["folder_root"], r["variant"], r["mode"], r["eta"])
+        key = (
+            r["folder_root"],
+            r["variant"],
+            r.get("gate_set"),
+            r.get("route"),
+            r.get("repel"),
+            r.get("mode"),
+            r.get("lam_const16"),
+            r.get("eta"),
+        )
         grouped[key].append(r)
 
     group_rows: List[Dict[str, Any]] = []
-    for (folder_root, variant, mode, eta), items in grouped.items():
+    for key, items in grouped.items():
+        folder_root, variant, gate_set, route, repel, mode, lam_const16, eta = key
         seeds = sorted(set(it.get("seed") for it in items if it.get("seed") is not None))
         ems = [it["em_rate"] for it in items]
         accs = [it["avg_row_acc"] for it in items]
@@ -248,7 +305,7 @@ def main():
         acc_mean, acc_std = _mean_std(accs)
         eqv_mean, eqv_std = _mean_std(eqvs)
 
-        # Sum counts across runs (these are already dataset totals per run)
+        # Sum counts across runs
         simpler_pred = sum(int(it.get("simpler_pred", 0)) for it in items)
         simpler_label = sum(int(it.get("simpler_label", 0)) for it in items)
         simpler_tie = sum(int(it.get("simpler_tie", 0)) for it in items)
@@ -258,7 +315,11 @@ def main():
         group_rows.append({
             "folder_root": folder_root,
             "variant": variant,
+            "gate_set": gate_set,
+            "route": route,
+            "repel": repel,
             "mode": mode,
+            "lam_const16": lam_const16,
             "eta": eta,
             "num_runs": len(items),
             "num_seeds": len(seeds),
@@ -279,7 +340,7 @@ def main():
     groups_csv = out_dir / "meta_groups.csv"
     with groups_csv.open("w", newline="") as f:
         fieldnames = [
-            "folder_root", "variant", "mode", "eta",
+            "folder_root", "variant", "gate_set", "route", "repel", "mode", "lam_const16", "eta",
             "num_runs", "num_seeds", "seeds",
             "em_mean", "em_std",
             "avg_row_acc_mean", "avg_row_acc_std",
@@ -289,22 +350,103 @@ def main():
         ]
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
-        for r in sorted(group_rows, key=lambda x: (x["folder_root"], x["variant"], str(x["mode"]), x["eta"] if x["eta"] is not None else -1)):
+        for r in sorted(
+            group_rows,
+            key=lambda x: (
+                x["folder_root"], x["variant"],
+                str(x.get("gate_set") or ""),
+                str(x.get("route") or ""),
+                str(x.get("repel") or ""),
+                str(x.get("mode") or ""),
+                x.get("lam_const16") if x.get("lam_const16") is not None else -1.0,
+                x.get("eta") if x.get("eta") is not None else -1.0,
+            ),
+        ):
             w.writerow({k: r.get(k, "") for k in fieldnames})
     print(f"[ok] Wrote grouped: {groups_csv}")
 
-    # Optional: EM pivot for pair sweep (eta rows x mode columns)
+    # ---------- best overall ----------
+    # Keep only per-run fields needed for ranking & reporting
+    best_overall = max(rows, key=_score_tuple)
+    best_overall_csv = out_dir / "best_overall.csv"
+    with best_overall_csv.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["run_dir", "em_rate", "avg_row_acc", "ratio_pred"])
+        w.writeheader()
+        w.writerow({
+            "run_dir": best_overall.get("run_dir", ""),
+            "em_rate": best_overall.get("em_rate", ""),
+            "avg_row_acc": best_overall.get("avg_row_acc", ""),
+            "ratio_pred": best_overall.get("ratio_pred", ""),
+        })
+    print(f"[ok] Wrote best overall: {best_overall_csv}")
+
+    # ---------- best by setup ----------
+    # Group key defining a "setup"
+    setup_groups: Dict[
+        Tuple[str, str, Optional[str], Optional[bool], Optional[str], Optional[float], Optional[float]],
+        List[Dict[str, Any]]
+    ] = defaultdict(list)
+    for r in rows:
+        setup_key = (
+            r["variant"],
+            str(r.get("gate_set") or ""),
+            r.get("route"),
+            r.get("repel"),
+            r.get("mode"),
+            r.get("lam_const16"),
+            r.get("eta"),
+        )
+        setup_groups[setup_key].append(r)
+
+    best_by_setup_rows: List[Dict[str, Any]] = []
+    for key, items in setup_groups.items():
+        variant, gate_set, route, repel, mode, lam_const16, eta = key
+        winner = max(items, key=_score_tuple)
+        best_by_setup_rows.append({
+            "variant": variant,
+            "gate_set": gate_set,
+            "route": route,
+            "repel": repel,
+            "mode": mode,
+            "lam_const16": lam_const16,
+            "eta": eta,
+            "run_dir": winner.get("run_dir", ""),
+            "em_rate": winner.get("em_rate", ""),
+            "avg_row_acc": winner.get("avg_row_acc", ""),
+            "ratio_pred": winner.get("ratio_pred", ""),
+        })
+
+    best_by_setup_csv = out_dir / "best_by_setup.csv"
+    with best_by_setup_csv.open("w", newline="") as f:
+        fieldnames = [
+            "variant", "gate_set", "route", "repel", "mode", "lam_const16", "eta",
+            "run_dir", "em_rate", "avg_row_acc", "ratio_pred",
+        ]
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in sorted(
+            best_by_setup_rows,
+            key=lambda x: (
+                x["variant"], str(x.get("gate_set") or ""),
+                str(x.get("route") or ""), str(x.get("repel") or ""),
+                str(x.get("mode") or ""),
+                x.get("lam_const16") if x.get("lam_const16") is not None else -1.0,
+                x.get("eta") if x.get("eta") is not None else -1.0,
+            ),
+        ):
+            w.writerow({k: r.get(k, "") for k in fieldnames})
+    print(f"[ok] Wrote best-by-setup: {best_by_setup_csv}")
+
+    # ---------- optional: EM pivot for pair sweep (eta rows x mode cols) ----------
     has_pair = any((r.get("mode") is not None and r.get("eta") is not None) for r in rows)
     if has_pair:
-        # Build mean EM per (mode, eta) across all roots/variants where mode/eta exist
-        em_by = defaultdict(list)  # (mode, eta) -> list of EMs
+        em_by = defaultdict(list)  # (mode, eta) -> [EMs]
         for r in rows:
             m = r.get("mode")
             e = r.get("eta")
             em = r.get("em_rate")
             if m is not None and e is not None and isinstance(em, (int, float)) and not math.isnan(em):
                 em_by[(m, e)].append(em)
-        # Collect unique sorted axes
         modes = sorted({m for (m, _e) in em_by.keys()})
         etas = sorted({e for (_m, e) in em_by.keys()})
 
