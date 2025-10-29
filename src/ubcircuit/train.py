@@ -12,7 +12,11 @@ import yaml
 from .modules import DepthStack
 from .utils import seed_all, safe_bce, make_async_taus, regularizers_bundle
 from . import tasks as T
-from .boolean_prims16 import set_sigma16_bandwidth
+from .boolean_prims16 import (
+    set_sigma16_bandwidth,
+    set_sigma16_mode,
+    set_sigma16_radius,
+)
 from .mi import top_mi_pairs, priors_from_pairs
 
 
@@ -23,7 +27,9 @@ DEFAULT_CFG: Dict[str, Any] = {
     "gate_set": "6",   # "6" (legacy) or "16" (compact)
     "sigma16": {                   # NEW: bandwidth anneal (used only if gate_set == "16")
         "s_start": 0.25,
-        "s_end": 0.10
+        "s_end": 0.10,
+        "mode":    "rbf",          # "rbf" | "bump" | "lagrange"
+        "radius":  0.75,           # used only if mode='bump'
     },
     "steps": 1200,
     "lr": 0.05,
@@ -65,11 +71,12 @@ def load_config(path: str | None) -> Dict[str, Any]:
     if path:
         user = yaml.safe_load(open(path)) or {}
         for k, v in user.items():
-            if isinstance(v, dict) and k in {"anneal", "regs", "aux", "early_stop", "pair"}:    
+            if isinstance(v, dict) and k in {"anneal", "regs", "aux", "early_stop", "pair", "sigma16"}:
                 cfg[k] = {**cfg[k], **v}
             else:
                 cfg[k] = v
     return cfg
+
 
 
 def _device(cfg) -> torch.device:
@@ -467,6 +474,13 @@ def train_single_instance(
 
 def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
     device = _device(cfg); seed_all(cfg["seed"])
+    # --- NEW: set global sigma16 behavior if using gate_set=16
+    if str(cfg.get("gate_set", "6")) == "16":
+        s16_cfg = cfg.get("sigma16", {})
+        set_sigma16_mode(str(s16_cfg.get("mode", "rbf")))
+        set_sigma16_radius(float(s16_cfg.get("radius", 0.75)))
+        # bandwidth only matters in mode='rbf'; we still keep the per-layer schedule below
+
     insts = T.load_instances_jsonl(cfg["dataset"])
 
     # L strategy (row / max / fixed)
@@ -555,6 +569,13 @@ def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
 
 def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
     device = _device(cfg); seed_all(cfg["seed"])
+    
+    # --- NEW: set global sigma16 behavior if using gate_set=16
+    if str(cfg.get("gate_set", "6")) == "16":
+        s16_cfg = cfg.get("sigma16", {})
+        set_sigma16_mode(str(s16_cfg.get("mode", "rbf")))
+        set_sigma16_radius(float(s16_cfg.get("radius", 0.75)))
+
     X, y_true = T.make_truth_table(cfg["task"])
     X = X.to(device); y_true = y_true.to(device)
 
