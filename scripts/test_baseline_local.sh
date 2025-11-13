@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DATASET="${PROJECT_DIR}/data/mini.jsonl"
+
+# Adjust this if your venv is elsewhere
+source "${PROJECT_DIR}/.venv/bin/activate"
+
+CFG="${PROJECT_DIR}/configs/mini_baseline_test.yaml"
+mkdir -p "$(dirname "${CFG}")"
+
+cat > "${CFG}" <<EOF
+seed: 0
+gate_set: "16"
+steps: 200
+optimizer: "rmsprop"
+lr: 0.001
+L: 2
+S: 2
+use_row_L: true
+anneal:
+  T0: 0.60
+  Tmin: 0.06
+  direction: "top_down"
+  schedule: "cosine"
+  phase_scale: 0.5
+sigma16:
+  mode: "rbf"
+  s_start: 0.25
+  s_end: 0.10
+  radius: 0.75
+pair:
+  route: "mi_soft"
+  prior_strength: 2.0
+  mi_disjoint: true
+  repel: false
+  mode: "log"
+  eta: 2.0
+regs:
+  lam_entropy: 1.0e-3
+  lam_div_units: 5.0e-4
+  lam_div_rows: 5.0e-4
+  lam_const16: 0.0
+early_stop:
+  use: false
+EOF
+
+OUT_DIR="${PROJECT_DIR}/experiments/baselines_test"
+mkdir -p "${OUT_DIR}"
+
+cd "${PROJECT_DIR}"
+
+python -m ubcircuit.baselines \
+  --dataset "${DATASET}" \
+  --config "${CFG}" \
+  --out_dir "${OUT_DIR}" \
+  --baseline "mlp" \
+  --match_mode "soft"
+
+echo "Local baseline test finished -> ${OUT_DIR}/summary.json"
