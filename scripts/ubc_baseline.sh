@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ubc_baseline_grid
 #SBATCH --account=def-ssanner
-#SBATCH --time=0-04:00:00
+#SBATCH --time=0-08:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --array=0-79
