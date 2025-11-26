@@ -31,6 +31,10 @@ DEFAULT_CFG: Dict[str, Any] = {
         "mode":    "rbf",          # "rbf" | "bump" | "lagrange"
         "radius":  0.75,           # used only if mode='bump'
     },
+    "lifting": {
+        "use": True,
+        "factor": 2.0,     # B_up ≈ factor * B
+    },
     "steps": 1200,
     "lr": 0.05,
     "optimizer": "rmsprop",
@@ -257,7 +261,9 @@ def compose_readout_full(
     outs0, Lrows0, unitWs0, PL0, PR0 = dbg[0]
     tau0 = final_taus[0]
 
-    if PL0 is None or PR0 is None:
+    # If we don't have PL/PR OR their width doesn't match B,
+    # fall back to assuming (a0, a1) for all units.
+    if (PL0 is None) or (PR0 is None) or (PL0.size(-1) != B):
         pair_syms = [("a0", "a1") for _ in range(Lrows0.shape[1])]
     else:
         PLp = torch.softmax(PL0 / max(tau0, 1e-8), dim=-1).detach()
@@ -265,6 +271,7 @@ def compose_readout_full(
         left_idx  = PLp.argmax(dim=1).tolist()
         right_idx = PRp.argmax(dim=1).tolist()
         pair_syms = [(base_syms[i], base_syms[j]) for i, j in zip(left_idx, right_idx)]
+
 
     unit_exprs = []
     for s, W in enumerate(unitWs0):
@@ -346,10 +353,17 @@ def train_single_instance(
             pair_cfg["PR_prior"] = PRp.tolist()
             # pair_cfg["prior_strength"] can be set in YAML (default e.g. 2.0)
 
+    lifting_cfg = cfg.get("lifting", {})
+    use_lifting = bool(lifting_cfg.get("use", True))
+    lift_factor = float(lifting_cfg.get("factor", 2.0))
+
     # ---- Build model with the (possibly) augmented pair_cfg ----
     model = DepthStack(B=B, L=L_used, S=S, tau=T0,
                     pair=pair_cfg,
-                    gate_set=gate_set).to(device)
+                    gate_set=gate_set,
+                    use_lifting=use_lifting,
+                    lift_factor=lift_factor,
+                    ).to(device)
 
 
     opt_name = str(cfg["optimizer"]).lower()
@@ -581,9 +595,17 @@ def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
 
     L, S = int(cfg["L"]), int(cfg["S"])    
     #model = DepthStack(B=2, L=L, S=S, tau=cfg["anneal"]["T0"], pair=cfg.get("pair", None)).to(device)
+
+    lifting_cfg = cfg.get("lifting", {})
+    use_lifting = bool(lifting_cfg.get("use", True))
+    lift_factor = float(lifting_cfg.get("factor", 2.0))
+
     model = DepthStack(B=2, L=L, S=S, tau=cfg["anneal"]["T0"],
                    pair=cfg.get("pair", None),
-                   gate_set=str(cfg.get("gate_set","6"))).to(device)
+                   gate_set=str(cfg.get("gate_set","6")),                   
+                   use_lifting=use_lifting,
+                   lift_factor=lift_factor,
+                   ).to(device)
 
     opt = (optim.RMSprop(model.parameters(), lr=cfg["lr"], alpha=0.99, eps=1e-8)
            if cfg["optimizer"].lower() == "rmsprop" else

@@ -16,8 +16,11 @@ Scan baseline runs (MLP / Transformer) for UBC Boolean tasks and produce:
                      gate_set, optimizer, route).
       For each group:
         * num_runs, num_seeds, seeds
-        * em_mean/std, avg_row_acc_mean/std
-        * avg_model_params_mean/std, avg_ubc_soft_params_mean/std, avg_ubc_total_params_mean/std
+        * em_mean/std/min/max
+        * avg_row_acc_mean/std/min/max
+        * avg_model_params_mean/std/min/max
+        * avg_ubc_soft_params_mean/std/min/max
+        * avg_ubc_total_params_mean/std/min/max
         * n_instances_total
 
   - best_overall.csv
@@ -41,6 +44,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import torch  # needed if you ever extend, but not critical right now
+
 
 def _read_json(p: Path) -> Optional[Dict[str, Any]]:
     try:
@@ -51,13 +56,17 @@ def _read_json(p: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _mean_std(xs: List[float]) -> Tuple[float, float]:
-    xs = [float(x) for x in xs if isinstance(x, (int, float)) and not math.isnan(x)]
-    if not xs:
-        return float("nan"), float("nan")
-    m = sum(xs) / len(xs)
-    var = sum((x - m) ** 2 for x in xs) / len(xs)
-    return m, math.sqrt(var)
+def _stats(xs: List[float]) -> Tuple[float, float, float, float]:
+    """
+    Return (mean, std, min, max) for a list, ignoring NaNs.
+    If xs is empty or all-NaN, returns (nan, nan, nan, nan).
+    """
+    vals = [float(x) for x in xs if isinstance(x, (int, float)) and not math.isnan(x)]
+    if not vals:
+        return (float("nan"), float("nan"), float("nan"), float("nan"))
+    m = sum(vals) / len(vals)
+    var = sum((x - m) ** 2 for x in vals) / len(vals)
+    return m, math.sqrt(var), min(vals), max(vals)
 
 
 def _extract_metrics_baseline(summary: Dict[str, Any]) -> Dict[str, Any]:
@@ -113,7 +122,6 @@ def _infer_baseline_meta(run_dir: Path, summary: Dict[str, Any]) -> Dict[str, An
     parts = run_dir.parts
 
     # --- variant from path ---
-    # try to distinguish "baselines/full_grid" vs other future variants
     if "baselines" in parts:
         if "full_grid" in parts:
             variant = "baselines_full_grid"
@@ -132,7 +140,6 @@ def _infer_baseline_meta(run_dir: Path, summary: Dict[str, Any]) -> Dict[str, An
         cfg = {}
 
     # --- basic config fields ---
-    # seed
     seed = None
     if "seed" in cfg:
         try:
@@ -140,7 +147,6 @@ def _infer_baseline_meta(run_dir: Path, summary: Dict[str, Any]) -> Dict[str, An
         except Exception:
             seed = None
 
-    # gate_set
     gate_set = None
     if "gate_set" in cfg:
         try:
@@ -148,7 +154,6 @@ def _infer_baseline_meta(run_dir: Path, summary: Dict[str, Any]) -> Dict[str, An
         except Exception:
             gate_set = None
 
-    # optimizer
     optimizer = None
     if "optimizer" in cfg:
         try:
@@ -156,7 +161,6 @@ def _infer_baseline_meta(run_dir: Path, summary: Dict[str, Any]) -> Dict[str, An
         except Exception:
             optimizer = None
 
-    # route (from pair sub-config)
     route = None
     pair = cfg.get("pair", {})
     if isinstance(pair, dict) and "route" in pair:
@@ -165,7 +169,6 @@ def _infer_baseline_meta(run_dir: Path, summary: Dict[str, Any]) -> Dict[str, An
         except Exception:
             route = None
 
-    # fallback seed from dir name: *_seed3_*
     if seed is None:
         import re
 
@@ -333,11 +336,11 @@ def main():
         params_total = [it["avg_ubc_total_params"] for it in items]
         n_instances_total = sum(int(it.get("n_instances") or 0) for it in items)
 
-        em_mean, em_std = _mean_std(ems)
-        acc_mean, acc_std = _mean_std(accs)
-        pm_mean, pm_std = _mean_std(params_model)
-        ps_mean, ps_std = _mean_std(params_soft)
-        pt_mean, pt_std = _mean_std(params_total)
+        em_mean, em_std, em_min, em_max = _stats(ems)
+        acc_mean, acc_std, acc_min, acc_max = _stats(accs)
+        pm_mean, pm_std, pm_min, pm_max = _stats(params_model)
+        ps_mean, ps_std, ps_min, ps_max = _stats(params_soft)
+        pt_mean, pt_std, pt_min, pt_max = _stats(params_total)
 
         group_rows.append(
             {
@@ -353,14 +356,24 @@ def main():
                 "seeds": ",".join(map(str, seeds)) if seeds else "",
                 "em_mean": em_mean,
                 "em_std": em_std,
+                "em_min": em_min,
+                "em_max": em_max,
                 "avg_row_acc_mean": acc_mean,
                 "avg_row_acc_std": acc_std,
+                "avg_row_acc_min": acc_min,
+                "avg_row_acc_max": acc_max,
                 "avg_model_params_mean": pm_mean,
                 "avg_model_params_std": pm_std,
+                "avg_model_params_min": pm_min,
+                "avg_model_params_max": pm_max,
                 "avg_ubc_soft_params_mean": ps_mean,
                 "avg_ubc_soft_params_std": ps_std,
+                "avg_ubc_soft_params_min": ps_min,
+                "avg_ubc_soft_params_max": ps_max,
                 "avg_ubc_total_params_mean": pt_mean,
                 "avg_ubc_total_params_std": pt_std,
+                "avg_ubc_total_params_min": pt_min,
+                "avg_ubc_total_params_max": pt_max,
                 "n_instances_total": n_instances_total,
             }
         )
@@ -380,14 +393,24 @@ def main():
             "seeds",
             "em_mean",
             "em_std",
+            "em_min",
+            "em_max",
             "avg_row_acc_mean",
             "avg_row_acc_std",
+            "avg_row_acc_min",
+            "avg_row_acc_max",
             "avg_model_params_mean",
             "avg_model_params_std",
+            "avg_model_params_min",
+            "avg_model_params_max",
             "avg_ubc_soft_params_mean",
             "avg_ubc_soft_params_std",
+            "avg_ubc_soft_params_min",
+            "avg_ubc_soft_params_max",
             "avg_ubc_total_params_mean",
             "avg_ubc_total_params_std",
+            "avg_ubc_total_params_min",
+            "avg_ubc_total_params_max",
             "n_instances_total",
         ]
         w = csv.DictWriter(f, fieldnames=fieldnames_groups)
@@ -448,7 +471,6 @@ def main():
     print(f"[ok] Wrote best overall: {best_overall_csv}")
 
     # -------- best by setup --------
-    # setup key: (variant, baseline, match_mode, gate_set, optimizer, route)
     SetupKey = Tuple[
         Optional[str],
         Optional[str],

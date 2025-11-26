@@ -11,6 +11,7 @@ from .boolean_prims import Rep2, sigma as sigma6
 from .boolean_prims16 import sigma16
 from .fixed_selector import FixedPairSelector
 from .utils import clamp01
+from .lifting import BitLifting   # NEW: lifting layer
 
 
 class BooleanUnit(nn.Module):
@@ -82,7 +83,6 @@ class PairSelector(nn.Module):
         if mode  is not None:
             assert mode in {"log", "mul", "hard-log", "hard-mul"}
             self.repel_mode = mode
-
 
     def set_tau(self, tau: float) -> None:
         self.tau = float(tau)
@@ -260,7 +260,6 @@ class GeneralLayer(nn.Module):
         x_next = torch.cat(next_bits, dim=-1)                        # (B,out_bits)
         unitWs = [u.W for u in self.units]
 
-
         temp = max(self.tau, 1e-8)
         PL_dbg = F.softmax(self.selector.PL / temp, dim=-1) if self.selector is not None else None
         if self.selector is None:
@@ -297,56 +296,56 @@ class GeneralLayer(nn.Module):
             "PR": PR_dbg,
         }
 
-        # dbg = {
-        #     "outs": outs,
-        #     "L_rows": L_rows,
-        #     "unitWs": unitWs,
-        #     "PL": (
-        #         F.softmax(self.selector.PL / max(self.tau, 1e-8), dim=-1)
-        #         if self.selector is not None else None
-        #     ),
-        #     "PR": (
-        #         F.softmax(
-        #             self.selector.PR / max(self.tau, 1e-8)
-        #             + self.selector.repel_eta * torch.log(
-        #                 clamp01(1.0 - F.softmax(self.selector.PL / max(self.tau, 1e-8), dim=-1))
-        #             ),
-        #             dim=-1,
-        #         )
-        #         if (self.selector is not None and self.selector.repel and self.selector.repel_mode == "log")
-        #         else (
-        #             F.softmax(self.selector.PR / max(self.tau, 1e-8), dim=-1)
-        #             if self.selector is not None else None
-        #         )
-        #     ),
-        # }
         return x_next, dbg
 
 
 class DepthStack(nn.Module):
     """
-    L layers: first is GeneralLayer(in_bits=B, out_bits=2), middle ReasoningLayer(2->2),
-    final ReasoningLayer(2->1).
+    L layers: optional BitLifting first (B -> B_eff),
+    then:
+      - first GeneralLayer(in_bits=B_eff, out_bits=2),
+      - (L-2) ReasoningLayer(2->2),
+      - final ReasoningLayer(2->1).
+
+    If use_lifting=False, behaves exactly like the original implementation (no lifting).
     """
     def __init__(self, B: int, L: int = 2, S: int = 2, tau: float = 0.3,
-                 pair: dict | None = None, gate_set: str = "6"):
+                 pair: dict | None = None, gate_set: str = "6",
+                 use_lifting: bool = True, lift_factor: float = 2.0):
         super().__init__()
         if L < 1:
             raise ValueError("L must be >= 1")
+
+        self.gate_set = gate_set
+        self.tau = float(tau)
+        self.L = int(L)
+        self.B_in = int(B)                    # original input bit-width
+        self.use_lifting = bool(use_lifting)
+
+        # --- Optional lifting: B_in -> B_eff ---
+        if self.use_lifting:
+            # simple heuristic: B_eff ≈ factor * B_in, but at least B_in
+            B_eff = int(round(self.B_in * float(lift_factor)))
+            if B_eff < self.B_in:
+                B_eff = self.B_in
+            self.lift = BitLifting(in_bits=self.B_in, out_bits=B_eff)
+            self.B_effective = B_eff
+        else:
+            self.lift = None
+            self.B_effective = self.B_in
+
+        # --- Stack of layers ---
         self.layers = nn.ModuleList([])
-        # First layer maps B -> 2 bits  
-        self.layers.append(GeneralLayer(in_bits=B, S=S, out_bits=2, tau=tau, pair=pair, gate_set=gate_set))
+        # First layer maps B_effective -> 2 bits
+        self.layers.append(
+            GeneralLayer(in_bits=self.B_effective, S=S, out_bits=2, tau=tau, pair=pair, gate_set=gate_set)
+        )
         # Middle (L-2) keep 2 -> 2
         for _ in range(max(L - 2, 0)):
             self.layers.append(ReasoningLayer(S=S, out_bits=2, tau=tau, gate_set=gate_set))
         # Final 2 -> 1
         if L >= 2:
             self.layers.append(ReasoningLayer(S=S, out_bits=1, tau=tau, gate_set=gate_set))
-        self.gate_set = gate_set
-        
-        self.tau = float(tau)
-        self.L = int(L)
-        self.B = int(B)
 
     def set_layer_taus(self, taus: List[float]) -> None:
         if len(taus) != len(self.layers):
@@ -366,10 +365,20 @@ class DepthStack(nn.Module):
                     if getattr(u, "gate_set", "6") == "16":
                         u.set_sigma16_bandwidth(s)
 
-
     def forward(self, xB: torch.Tensor):
+        """
+        xB: (BATCH, B_in) in {0,1}
+        """
+        if xB.size(-1) != self.B_in:
+            raise ValueError(f"DepthStack expected input dim {self.B_in}, got {xB.size(-1)}")
+
+        # Optional bit lifting
+        if self.lift is not None:
+            x = self.lift(xB)        # (BATCH, B_effective)
+        else:
+            x = xB
+
         dbg_list = []
-        x = xB
         for li, layer in enumerate(self.layers):
             out = layer(x)
             if isinstance(layer, GeneralLayer):
