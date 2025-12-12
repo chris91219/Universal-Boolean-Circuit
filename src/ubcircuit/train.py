@@ -1,10 +1,13 @@
 # src/ubcircuit/train.py
 from __future__ import annotations
 
-import argparse, json, re
-from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
+import argparse
+import json
+import math
+import re
 from collections import Counter
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -52,12 +55,7 @@ DEFAULT_CFG: Dict[str, Any] = {
         "phase_scale": 0.4,
         "start_frac": 0.0
     },
-    "regs": {
-        "lam_entropy": 1.0e-3,
-        "lam_div_units": 5.0e-4,
-        "lam_div_rows": 5.0e-4,
-        "lam_const16": 5.0e-3
-    },
+    "regs": {"lam_entropy": 1.0e-3, "lam_div_units": 5.0e-4, "lam_div_rows": 5.0e-4, "lam_const16": 5.0e-3},
     "pair": {
         "repel": True,
         "eta": 1.0,
@@ -103,7 +101,22 @@ def per_instance_metrics(y_true: torch.Tensor, y_pred: torch.Tensor) -> Tuple[fl
     return row_acc, em
 
 
-# ---------- Robust MI routing (fixes B=2 mi_soft crash + S>pairs cases) ----------
+# ---------- Lifting: compute effective input width (must match modules.py expectation) ----------
+def compute_B_effective(B: int, use_lifting: bool, lift_factor: float) -> int:
+    """
+    Compute the effective input width used by DepthStack when lifting is enabled.
+
+    NOTE: This must agree with DepthStack's internal B_effective logic. The common
+    interpretation in this repo is:
+        B_eff = ceil(lift_factor * B)  (and at least B)
+    """
+    B = int(B)
+    if not use_lifting:
+        return B
+    return max(B, int(math.ceil(float(lift_factor) * B)))
+
+
+# ---------- Robust MI routing (fixes B=2 mi_soft crash + S>pairs + lifting mismatch) ----------
 def _tile_pairs(pairs: List[Tuple[int, int]], S: int) -> List[Tuple[int, int]]:
     if not pairs:
         return []
@@ -118,10 +131,33 @@ def _tile_rows(M: torch.Tensor, S: int) -> torch.Tensor:
     return M.repeat(reps, 1)[:S]
 
 
+def _expand_prior_to_Beff(P: torch.Tensor, B_eff: int, eps: float = 1e-6) -> torch.Tensor:
+    """
+    Expand a prior P (S,B_base) to (S,B_eff) by placing P into the first B_base columns,
+    putting a tiny eps mass into the extra columns, then renormalizing.
+
+    This is needed when lifting makes the model's PairSelector dimension be B_eff while
+    MI priors are computed over the original B bits.
+    """
+    if P.dim() != 2:
+        raise ValueError(f"Expected 2D prior, got {tuple(P.shape)}")
+    S, B_base = P.shape
+    if B_eff == B_base:
+        return P
+    if B_eff < B_base:
+        return P[:, :B_eff]
+
+    out = torch.full((S, B_eff), float(eps), device=P.device, dtype=P.dtype)
+    out[:, :B_base] += P
+    out = out / out.sum(dim=1, keepdim=True).clamp_min(1e-12)
+    return out
+
+
 def resolve_pair_cfg(
     pair_cfg_in: Dict[str, Any],
     *,
     B: int,
+    B_eff: int,
     S: int,
     X: torch.Tensor,
     y_true: torch.Tensor,
@@ -129,14 +165,15 @@ def resolve_pair_cfg(
     """
     Ensure pair_cfg is consistent for PairSelector.
 
-    - learned: nothing to do.
-    - mi_hard: provide fixed_pairs of length S.
-    - mi_soft: provide PL_prior/PR_prior of shape (S,B).
+    - learned: return as-is.
+    - mi_hard: provide fixed_pairs of length S (indices in [0,B-1], valid subset of [0,B_eff-1]).
+    - mi_soft: provide PL_prior/PR_prior of shape (S,B_eff).
 
-    Also handles:
+    Handles:
       - B=2 (previously crashed because priors weren't computed)
-      - cases where top_mi_pairs returns fewer than S pairs (tile to length S)
-      - cases where no pairs can be formed (fallback to learned)
+      - cases where top_mi_pairs returns fewer than S pairs (tile)
+      - lifting (B_eff > B): expand priors to B_eff so PairSelector assert passes
+      - cases where no pairs can be formed: fallback to learned
     """
     pair_cfg = dict(pair_cfg_in or {})
     route = str(pair_cfg.get("route", "learned"))
@@ -145,7 +182,6 @@ def resolve_pair_cfg(
         return pair_cfg
 
     if B < 2:
-        # no valid 2-input pairing possible
         pair_cfg["route"] = "learned"
         pair_cfg.pop("PL_prior", None)
         pair_cfg.pop("PR_prior", None)
@@ -153,12 +189,9 @@ def resolve_pair_cfg(
         return pair_cfg
 
     disjoint = bool(pair_cfg.get("mi_disjoint", True))
-
-    # Ask for up to S. For disjoint pairing, maximum distinct pairs is floor(B/2).
     pairs = top_mi_pairs(X, y_true, S=S, disjoint=disjoint)
 
     if not pairs:
-        # Can't form any pair -> fallback to learned
         pair_cfg["route"] = "learned"
         pair_cfg.pop("PL_prior", None)
         pair_cfg.pop("PR_prior", None)
@@ -172,10 +205,15 @@ def resolve_pair_cfg(
         return pair_cfg
 
     # mi_soft
-    PLp, PRp = priors_from_pairs(pairs, B)  # (len(pairs), B) typically
+    PLp, PRp = priors_from_pairs(pairs, B)  # (len(pairs), B)
     if PLp.size(0) != S:
         PLp = _tile_rows(PLp, S)
         PRp = _tile_rows(PRp, S)
+
+    # Expand to effective dimension if lifting is on
+    if int(B_eff) != int(B):
+        PLp = _expand_prior_to_Beff(PLp, int(B_eff))
+        PRp = _expand_prior_to_Beff(PRp, int(B_eff))
 
     pair_cfg["PL_prior"] = PLp.tolist()
     pair_cfg["PR_prior"] = PRp.tolist()
@@ -184,13 +222,6 @@ def resolve_pair_cfg(
 
 
 # ---------- Expression normalization (align style with labels, NO SIMPLIFY) ----------
-# Convert arithmetic NOT to tilde form without logical simplification.
-# Examples:
-#   (1 - a0)            -> (~a0)
-#   (1 - (~a0))         -> (~(~a0))
-#   (1 - (1 - (~a0)))   -> (~(~(~a0)))
-# We intentionally DO NOT collapse ~~X -> X, etc.
-
 _NOT_A_BARE        = re.compile(r"\(\s*1\s*-\s*a(\d+)\s*\)")
 _NOT_PARENS_ANY    = re.compile(r"\(\s*1\s*-\s*\(\s*(.+?)\s*\)\s*\)")
 _TILDE_LIT_PARENS  = re.compile(r"\(~\(\s*a(\d+)\s*\)\)")  # (~(aK)) -> (~aK)
@@ -348,7 +379,7 @@ def compose_readout_full(
     outs0, Lrows0, unitWs0, PL0, PR0 = dbg[0]
     tau0 = final_taus[0]
 
-    # If we don't have PL/PR OR their width doesn't match B,
+    # If we don't have PL/PR OR their width doesn't match base B,
     # fall back to assuming (a0, a1) for all units.
     if (PL0 is None) or (PR0 is None) or (PL0.size(-1) != B):
         pair_syms = [("a0", "a1") for _ in range(Lrows0.shape[1])]
@@ -401,19 +432,12 @@ def extract_gate_usage_from_dbg(
     taus: List[float],
     PRIMS: List[str],
 ) -> Dict[str, Any]:
-    """
-    Compute gate usage at the given taus.
-
-    - path_counts: primitives actually selected by row-picks (realized circuit path)
-    - all_unit_counts: argmax primitive for every unit (regardless of row pick)
-    - path_list: flat list of path primitives in layer order
-    """
     path = Counter()
     allu = Counter()
     path_list: List[str] = []
 
     for li, layer_dbg in enumerate(dbg):
-        outs, Lrows, unitWs, _PL, _PR = layer_dbg
+        _outs, Lrows, unitWs, _PL, _PR = layer_dbg
         tau = float(taus[li])
 
         for W in unitWs:
@@ -468,14 +492,15 @@ def train_single_instance(
     else:
         from .boolean_prims import PRIMS as PRIMS_LIST
 
-    # ---- Pair config (robust routing) ----
-    pair_cfg = dict(cfg.get("pair", {}) or {})
-    pair_cfg = resolve_pair_cfg(pair_cfg, B=B, S=S, X=X, y_true=y_true)
-
     # ---- Lifting ----
     lifting_cfg = cfg.get("lifting", {})
     use_lifting = bool(lifting_cfg.get("use", True))
     lift_factor = float(lifting_cfg.get("factor", 2.0))
+    B_eff = compute_B_effective(B, use_lifting, lift_factor)
+
+    # ---- Pair config (robust routing + lifting-aware priors) ----
+    pair_cfg = dict(cfg.get("pair", {}) or {})
+    pair_cfg = resolve_pair_cfg(pair_cfg, B=B, B_eff=B_eff, S=S, X=X, y_true=y_true)
 
     # ---- Build model ----
     model = DepthStack(
@@ -503,7 +528,7 @@ def train_single_instance(
     min_steps = int(es_cfg.get("min_steps", 0))
     check_every = int(es_cfg.get("check_every", 10))
     patience_checks = int(es_cfg.get("patience_checks", 3))
-    metric = str(es_cfg.get("metric", "em")).lower()   # "em" or "row_acc"
+    metric = str(es_cfg.get("metric", "em")).lower()
     target = float(es_cfg.get("target", 1.0))
     ok_streak = 0
 
@@ -544,7 +569,6 @@ def train_single_instance(
         (loss + reg).backward()
         opt.step()
 
-        # Early stopping
         if use_es and (step + 1) >= min_steps and ((step + 1) % check_every == 0):
             with torch.no_grad():
                 row_acc, em = per_instance_metrics(y_true, y_pred)
@@ -554,7 +578,6 @@ def train_single_instance(
                     print(f"  [early-stop] step={step+1}, metric={metric}={cur_val:.3f} (target={target})")
                     break
 
-    # Final eval & report
     with torch.no_grad():
         if last_dbg is None:
             y_pred, dbg = model(X)
@@ -615,7 +638,6 @@ def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
     device = _device(cfg)
     seed_all(cfg["seed"])
 
-    # set global sigma16 behavior if using gate_set=16
     if str(cfg.get("gate_set", "6")) == "16":
         s16_cfg = cfg.get("sigma16", {})
         set_sigma16_mode(str(s16_cfg.get("mode", "rbf")))
@@ -623,7 +645,6 @@ def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
 
     insts = T.load_instances_jsonl(cfg["dataset"])
 
-    # L strategy (row / max / fixed)
     global_L: Optional[int] = None
     l_strategy = "row" if cfg.get("use_row_L", True) else (
         "max" if cfg.get("use_max_L", False) else "fixed"
@@ -647,16 +668,15 @@ def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
         print(f"   label: {res['label_expr']}")
         print(f"   pred : {res['pred_expr']}")
 
-    # Aggregates (macro averages across instances)
     n = max(1, len(results))
     avg_row_acc = sum(r["row_acc"] for r in results) / n
     em_rate     = sum(r["em"]      for r in results) / n
     equiv_rate  = sum(r["equiv"]   for r in results) / n
 
-    # Histograms / breakdowns
     L_used_hist = Counter(r["L_used"] for r in results)
     S_hist      = Counter(r["S"]      for r in results)
     B_hist      = Counter(r["B"]      for r in results)
+
     simpler_hist = Counter(r["simpler"] for r in results)
     for k in ["pred", "label", "tie", "same"]:
         simpler_hist.setdefault(k, 0)
@@ -668,7 +688,6 @@ def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
           f"tie={simpler_ratios['tie']:.3f}, "
           f"same={simpler_ratios['same']:.3f}")
 
-    # Aggregate gate usage across instances (so analyzer can read at run-level)
     gate_path_tot = Counter()
     gate_all_tot  = Counter()
     for r in results:
@@ -681,7 +700,6 @@ def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
             if isinstance(ac, dict):
                 gate_all_tot.update({k: int(v) for k, v in ac.items()})
 
-    # Dataset-aware config snapshot
     cfg_eff = dict(cfg)
     if cfg_eff.get("dataset"):
         if l_strategy == "row":
@@ -712,7 +730,7 @@ def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
             "path_counts": dict(gate_path_tot),
             "all_unit_counts": dict(gate_all_tot),
         },
-        "results": results,
+        "results": results
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     print(f"\nSaved summary to: {out_dir / 'summary.json'}")
@@ -724,7 +742,6 @@ def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
     device = _device(cfg)
     seed_all(cfg["seed"])
 
-    # set global sigma16 behavior if using gate_set=16
     if str(cfg.get("gate_set", "6")) == "16":
         s16_cfg = cfg.get("sigma16", {})
         set_sigma16_mode(str(s16_cfg.get("mode", "rbf")))
@@ -739,10 +756,10 @@ def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
     lifting_cfg = cfg.get("lifting", {})
     use_lifting = bool(lifting_cfg.get("use", True))
     lift_factor = float(lifting_cfg.get("factor", 2.0))
+    B_eff = compute_B_effective(2, use_lifting, lift_factor)
 
-    # resolve pair cfg robustly for B=2
     pair_cfg = dict(cfg.get("pair", {}) or {})
-    pair_cfg = resolve_pair_cfg(pair_cfg, B=2, S=S, X=X, y_true=y_true)
+    pair_cfg = resolve_pair_cfg(pair_cfg, B=2, B_eff=B_eff, S=S, X=X, y_true=y_true)
 
     model = DepthStack(
         B=2, L=L, S=S, tau=cfg["anneal"]["T0"],
@@ -752,11 +769,9 @@ def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
         lift_factor=lift_factor,
     ).to(device)
 
-    opt = (
-        optim.RMSprop(model.parameters(), lr=cfg["lr"], alpha=0.99, eps=1e-8)
-        if cfg["optimizer"].lower() == "rmsprop"
-        else optim.Adam(model.parameters(), lr=cfg["lr"])
-    )
+    opt = (optim.RMSprop(model.parameters(), lr=cfg["lr"], alpha=0.99, eps=1e-8)
+           if cfg["optimizer"].lower() == "rmsprop" else
+           optim.Adam(model.parameters(), lr=cfg["lr"]))
     steps = int(cfg["steps"])
     regs_cfg = cfg["regs"]
     anneal_cfg = cfg["anneal"]
@@ -848,7 +863,6 @@ def main():
     if args.dataset is not None:
         cfg["dataset"] = args.dataset
 
-    # Flags override config defaults
     if args.no_row_L:
         cfg["use_row_L"] = False
     if args.use_row_L:
