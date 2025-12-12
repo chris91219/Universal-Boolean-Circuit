@@ -1,12 +1,9 @@
 # src/ubcircuit/train.py
 from __future__ import annotations
 
-import argparse
-import json
-import re
+import argparse, json, re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
-
 from collections import Counter
 
 import torch
@@ -30,7 +27,7 @@ DEFAULT_CFG: Dict[str, Any] = {
     "L": 2,
     "S": 2,
     "gate_set": "6",   # "6" (legacy) or "16" (compact)
-    "sigma16": {                   # NEW: bandwidth anneal (used only if gate_set == "16")
+    "sigma16": {                   # bandwidth anneal (used only if gate_set == "16")
         "s_start": 0.25,
         "s_end": 0.10,
         "mode":    "rbf",          # "rbf" | "bump" | "lagrange"
@@ -55,12 +52,17 @@ DEFAULT_CFG: Dict[str, Any] = {
         "phase_scale": 0.4,
         "start_frac": 0.0
     },
-    "regs": {"lam_entropy": 1.0e-3, "lam_div_units": 5.0e-4, "lam_div_rows": 5.0e-4, "lam_const16": 5.0e-3},
+    "regs": {
+        "lam_entropy": 1.0e-3,
+        "lam_div_units": 5.0e-4,
+        "lam_div_rows": 5.0e-4,
+        "lam_const16": 5.0e-3
+    },
     "pair": {
         "repel": True,
         "eta": 1.0,
         "mode": "hard-log",   # right-pick repulsion
-        "route": "learned",   # NEW: "learned" | "mi_soft" | "mi_hard"
+        "route": "learned",   # "learned" | "mi_soft" | "mi_hard"
     },
     "aux": {"use": False, "lam": 1.0e-2, "wire_targets": ["AND", "NOTA"]},
     "dataset": None,  # path to JSONL with rows like {"B":int,"S":int,"L":int,"formula":str}
@@ -80,7 +82,7 @@ def load_config(path: str | None) -> Dict[str, Any]:
     if path:
         user = yaml.safe_load(open(path)) or {}
         for k, v in user.items():
-            if isinstance(v, dict) and k in {"anneal", "regs", "aux", "early_stop", "pair", "sigma16"}:
+            if isinstance(v, dict) and k in {"anneal", "regs", "aux", "early_stop", "pair", "sigma16", "lifting"}:
                 cfg[k] = {**cfg[k], **v}
             else:
                 cfg[k] = v
@@ -101,50 +103,84 @@ def per_instance_metrics(y_true: torch.Tensor, y_pred: torch.Tensor) -> Tuple[fl
     return row_acc, em
 
 
-# ---------- Gate usage extraction ----------
-def extract_gate_usage_from_dbg(
-    dbg: List[tuple],
-    taus: List[float],
-    PRIMS: List[str],
+# ---------- Robust MI routing (fixes B=2 mi_soft crash + S>pairs cases) ----------
+def _tile_pairs(pairs: List[Tuple[int, int]], S: int) -> List[Tuple[int, int]]:
+    if not pairs:
+        return []
+    reps = (S + len(pairs) - 1) // len(pairs)
+    return (pairs * reps)[:S]
+
+
+def _tile_rows(M: torch.Tensor, S: int) -> torch.Tensor:
+    if M.size(0) == S:
+        return M
+    reps = (S + M.size(0) - 1) // M.size(0)
+    return M.repeat(reps, 1)[:S]
+
+
+def resolve_pair_cfg(
+    pair_cfg_in: Dict[str, Any],
+    *,
+    B: int,
+    S: int,
+    X: torch.Tensor,
+    y_true: torch.Tensor,
 ) -> Dict[str, Any]:
     """
-    Compute gate usage from dbg at the given taus.
+    Ensure pair_cfg is consistent for PairSelector.
 
-    Two notions:
-      - path_counts: only primitives actually selected by row-picks (realized circuit path)
-      - all_unit_counts: argmax primitive for every unit, regardless of row pick
-    Also saves a flat path_list in layer order.
+    - learned: nothing to do.
+    - mi_hard: provide fixed_pairs of length S.
+    - mi_soft: provide PL_prior/PR_prior of shape (S,B).
+
+    Also handles:
+      - B=2 (previously crashed because priors weren't computed)
+      - cases where top_mi_pairs returns fewer than S pairs (tile to length S)
+      - cases where no pairs can be formed (fallback to learned)
     """
-    path = Counter()
-    allu = Counter()
-    path_list: List[str] = []
+    pair_cfg = dict(pair_cfg_in or {})
+    route = str(pair_cfg.get("route", "learned"))
 
-    for li, layer_dbg in enumerate(dbg):
-        outs, Lrows, unitWs, _PL, _PR = layer_dbg
-        tau = float(taus[li])
+    if route not in {"mi_soft", "mi_hard"}:
+        return pair_cfg
 
-        # all-unit argmax
-        for W in unitWs:
-            p = torch.softmax(W / max(tau, 1e-8), dim=0)
-            prim = PRIMS[int(p.argmax().item())]
-            allu[prim] += 1
+    if B < 2:
+        # no valid 2-input pairing possible
+        pair_cfg["route"] = "learned"
+        pair_cfg.pop("PL_prior", None)
+        pair_cfg.pop("PR_prior", None)
+        pair_cfg.pop("fixed_pairs", None)
+        return pair_cfg
 
-        # path: for each output row, pick the selected unit and count its primitive
-        if isinstance(Lrows, torch.Tensor) and Lrows.dim() == 2:
-            out_bits = int(Lrows.shape[0])
-            for k in range(out_bits):
-                u_idx = int(Lrows[k].argmax().item())
-                W = unitWs[u_idx]
-                p = torch.softmax(W / max(tau, 1e-8), dim=0)
-                prim = PRIMS[int(p.argmax().item())]
-                path[prim] += 1
-                path_list.append(prim)
+    disjoint = bool(pair_cfg.get("mi_disjoint", True))
 
-    return {
-        "path_counts": dict(path),
-        "all_unit_counts": dict(allu),
-        "path_list": path_list,
-    }
+    # Ask for up to S. For disjoint pairing, maximum distinct pairs is floor(B/2).
+    pairs = top_mi_pairs(X, y_true, S=S, disjoint=disjoint)
+
+    if not pairs:
+        # Can't form any pair -> fallback to learned
+        pair_cfg["route"] = "learned"
+        pair_cfg.pop("PL_prior", None)
+        pair_cfg.pop("PR_prior", None)
+        pair_cfg.pop("fixed_pairs", None)
+        return pair_cfg
+
+    if route == "mi_hard":
+        pair_cfg["fixed_pairs"] = _tile_pairs(pairs, S)
+        pair_cfg.pop("PL_prior", None)
+        pair_cfg.pop("PR_prior", None)
+        return pair_cfg
+
+    # mi_soft
+    PLp, PRp = priors_from_pairs(pairs, B)  # (len(pairs), B) typically
+    if PLp.size(0) != S:
+        PLp = _tile_rows(PLp, S)
+        PRp = _tile_rows(PRp, S)
+
+    pair_cfg["PL_prior"] = PLp.tolist()
+    pair_cfg["PR_prior"] = PRp.tolist()
+    pair_cfg.pop("fixed_pairs", None)
+    return pair_cfg
 
 
 # ---------- Expression normalization (align style with labels, NO SIMPLIFY) ----------
@@ -162,15 +198,12 @@ _TILDE_LIT_PARENS  = re.compile(r"\(~\(\s*a(\d+)\s*\)\)")  # (~(aK)) -> (~aK)
 
 def _to_tilde_not(expr: str) -> str:
     s = expr
-    # (1 - aK) -> (~aK)
     s = _NOT_A_BARE.sub(r"(~a\1)", s)
-    # (1 - (X)) -> (~(X))  (repeat a few times to catch nesting)
     for _ in range(8):
         s2 = _NOT_PARENS_ANY.sub(r"(~(\1))", s)
         if s2 == s:
             break
         s = s2
-    # (~(aK)) -> (~aK) (cosmetic)
     s = _TILDE_LIT_PARENS.sub(r"(~a\1)", s)
     return s
 
@@ -222,13 +255,13 @@ def _force_balance_counts(expr: str) -> str:
         j = s.rfind(")")
         if j < 0:
             break
-        s = s[:j] + s[j + 1:]
+        s = s[:j] + s[j+1:]
         closes -= 1
     while opens > closes:
         i = s.find("(")
         if i < 0:
             break
-        s = s[:i] + s[i + 1:]
+        s = s[:i] + s[i+1:]
         opens -= 1
     return s
 
@@ -246,7 +279,7 @@ def _canonical_spaces(expr: str) -> str:
 def normalize_expr(expr: str) -> str:
     if not expr:
         return expr
-    s = _to_tilde_not(expr)   # NO simplification beyond formatting to tilde form
+    s = _to_tilde_not(expr)
     s = _balance_parens(s)
     s = _force_balance_counts(s)
     s = _strip_outer_parens(s)
@@ -258,7 +291,7 @@ def expr_complexity(expr: str) -> Tuple[int, int]:
     s = expr.replace(" ", "")
     char_len = len(s)
     num_vars = len(re.findall(r"a\d+", s))
-    num_ops = s.count("&") + s.count("|") + s.count("~")
+    num_ops  = s.count("&") + s.count("|") + s.count("~")
     token_score = num_vars + num_ops
     return char_len, token_score
 
@@ -266,54 +299,31 @@ def expr_complexity(expr: str) -> Tuple[int, int]:
 # ---------- Layer-by-layer composed symbolic readout ----------
 def _apply_prim_to_syms(prim: str, a_sym: str, b_sym: str) -> str:
     # ---- legacy 6 features
-    if prim.startswith("AND"):
-        return f"({a_sym} & {b_sym})"
-    if prim.startswith("OR("):
-        return f"({a_sym} | {b_sym})"
-    if prim.startswith("NOT(a)"):
-        return f"(1 - {a_sym})"
-    if prim.startswith("NOT(b)"):
-        return f"(1 - {b_sym})"
-    if prim.startswith("a (skip)"):
-        return f"{a_sym}"
-    if prim.startswith("b (skip)"):
-        return f"{b_sym}"
+    if prim.startswith("AND"):        return f"({a_sym} & {b_sym})"
+    if prim.startswith("OR("):        return f"({a_sym} | {b_sym})"
+    if prim.startswith("NOT(a)"):     return f"(1 - {a_sym})"
+    if prim.startswith("NOT(b)"):     return f"(1 - {b_sym})"
+    if prim.startswith("a (skip)"):   return f"{a_sym}"
+    if prim.startswith("b (skip)"):   return f"{b_sym}"
 
     # ---- 16-gate names
-    if prim == "FALSE":
-        return "0"
-    if prim == "TRUE":
-        return "1"
-    if prim == "A":
-        return f"{a_sym}"
-    if prim == "B":
-        return f"{b_sym}"
-    if prim == "~A":
-        return f"(1 - {a_sym})"
-    if prim == "~B":
-        return f"(1 - {b_sym})"
-    if prim == "AND":
-        return f"({a_sym} & {b_sym})"
-    if prim == "OR":
-        return f"({a_sym} | {b_sym})"
-    if prim == "XOR":
-        return f"(({a_sym} & (1 - {b_sym})) | ((1 - {a_sym}) & {b_sym}))"
-    if prim == "XNOR":
-        return f"(1 - (({a_sym} & (1 - {b_sym})) | ((1 - {a_sym}) & {b_sym})))"
-    if prim == "NAND":
-        return f"(1 - ({a_sym} & {b_sym}))"
-    if prim == "NOR":
-        return f"(1 - ({a_sym} | {b_sym}))"
-    if prim == "A&~B":
-        return f"({a_sym} & (1 - {b_sym}))"
-    if prim == "~A&B":
-        return f"((1 - {a_sym}) & {b_sym})"
-    if prim == "A|~B":
-        return f"({a_sym} | (1 - {b_sym}))"
-    if prim == "~A|B":
-        return f"((1 - {a_sym}) | {b_sym})"
+    if prim == "FALSE":    return "0"
+    if prim == "TRUE":     return "1"
+    if prim == "A":        return f"{a_sym}"
+    if prim == "B":        return f"{b_sym}"
+    if prim == "~A":       return f"(1 - {a_sym})"
+    if prim == "~B":       return f"(1 - {b_sym})"
+    if prim == "AND":      return f"({a_sym} & {b_sym})"
+    if prim == "OR":       return f"({a_sym} | {b_sym})"
+    if prim == "XOR":      return f"(({a_sym} & (1 - {b_sym})) | ((1 - {a_sym}) & {b_sym}))"
+    if prim == "XNOR":     return f"(1 - (({a_sym} & (1 - {b_sym})) | ((1 - {a_sym}) & {b_sym})))"
+    if prim == "NAND":     return f"(1 - ({a_sym} & {b_sym}))"
+    if prim == "NOR":      return f"(1 - ({a_sym} | {b_sym}))"
+    if prim == "A&~B":     return f"({a_sym} & (1 - {b_sym}))"
+    if prim == "~A&B":     return f"((1 - {a_sym}) & {b_sym})"
+    if prim == "A|~B":     return f"({a_sym} | (1 - {b_sym}))"
+    if prim == "~A|B":     return f"((1 - {a_sym}) | {b_sym})"
 
-    # Fallback
     return f"({a_sym} | {b_sym})"
 
 
@@ -345,7 +355,7 @@ def compose_readout_full(
     else:
         PLp = torch.softmax(PL0 / max(tau0, 1e-8), dim=-1).detach()
         PRp = torch.softmax(PR0 / max(tau0, 1e-8), dim=-1).detach()
-        left_idx = PLp.argmax(dim=1).tolist()
+        left_idx  = PLp.argmax(dim=1).tolist()
         right_idx = PRp.argmax(dim=1).tolist()
         pair_syms = [(base_syms[i], base_syms[j]) for i, j in zip(left_idx, right_idx)]
 
@@ -385,6 +395,49 @@ def compose_readout_full(
     return final_unit_exprs[u_final]
 
 
+# ---------- Gate usage extraction ----------
+def extract_gate_usage_from_dbg(
+    dbg: List[tuple],
+    taus: List[float],
+    PRIMS: List[str],
+) -> Dict[str, Any]:
+    """
+    Compute gate usage at the given taus.
+
+    - path_counts: primitives actually selected by row-picks (realized circuit path)
+    - all_unit_counts: argmax primitive for every unit (regardless of row pick)
+    - path_list: flat list of path primitives in layer order
+    """
+    path = Counter()
+    allu = Counter()
+    path_list: List[str] = []
+
+    for li, layer_dbg in enumerate(dbg):
+        outs, Lrows, unitWs, _PL, _PR = layer_dbg
+        tau = float(taus[li])
+
+        for W in unitWs:
+            p = torch.softmax(W / max(tau, 1e-8), dim=0)
+            prim = PRIMS[int(p.argmax().item())]
+            allu[prim] += 1
+
+        if isinstance(Lrows, torch.Tensor) and Lrows.dim() == 2:
+            out_bits = int(Lrows.shape[0])
+            for k in range(out_bits):
+                u_idx = int(Lrows[k].argmax().item())
+                W = unitWs[u_idx]
+                p = torch.softmax(W / max(tau, 1e-8), dim=0)
+                prim = PRIMS[int(p.argmax().item())]
+                path[prim] += 1
+                path_list.append(prim)
+
+    return {
+        "path_counts": dict(path),
+        "all_unit_counts": dict(allu),
+        "path_list": path_list,
+    }
+
+
 # ---------- Training (single instance) ----------
 def train_single_instance(
     device,
@@ -415,24 +468,16 @@ def train_single_instance(
     else:
         from .boolean_prims import PRIMS as PRIMS_LIST
 
-    # ---- Pair config with routing modes: learned | mi_soft | mi_hard ----
-    pair_cfg = dict(cfg.get("pair", {}))  # copy
-    route = str(pair_cfg.get("route", "learned"))
-    if (B > 2) and route in {"mi_soft", "mi_hard"}:
-        pairs = top_mi_pairs(X, y_true, S=S, disjoint=bool(pair_cfg.get("mi_disjoint", True)))
-        if route == "mi_hard":
-            pair_cfg["fixed_pairs"] = pairs  # for FixedPairSelector in GeneralLayer
-        else:  # mi_soft
-            PLp, PRp = priors_from_pairs(pairs, B)
-            pair_cfg["PL_prior"] = PLp.tolist()
-            pair_cfg["PR_prior"] = PRp.tolist()
-            # pair_cfg["prior_strength"] can be set in YAML (default e.g. 2.0)
+    # ---- Pair config (robust routing) ----
+    pair_cfg = dict(cfg.get("pair", {}) or {})
+    pair_cfg = resolve_pair_cfg(pair_cfg, B=B, S=S, X=X, y_true=y_true)
 
+    # ---- Lifting ----
     lifting_cfg = cfg.get("lifting", {})
     use_lifting = bool(lifting_cfg.get("use", True))
     lift_factor = float(lifting_cfg.get("factor", 2.0))
 
-    # ---- Build model with the (possibly) augmented pair_cfg ----
+    # ---- Build model ----
     model = DepthStack(
         B=B,
         L=L_used,
@@ -452,7 +497,6 @@ def train_single_instance(
     )
     steps = int(cfg["steps"])
     regs_cfg = cfg["regs"]
-    anneal_cfg = cfg["anneal"]
 
     es_cfg = cfg.get("early_stop", {})
     use_es = bool(es_cfg.get("use", False))
@@ -466,21 +510,18 @@ def train_single_instance(
     last_dbg = None
     for step in range(steps):
         taus = make_async_taus(
-            L=len(model.layers),
-            step=step,
-            total=steps,
-            T0=anneal_cfg["T0"],
-            Tmin=anneal_cfg["Tmin"],
+            L=len(model.layers), step=step, total=steps,
+            T0=anneal_cfg["T0"], Tmin=anneal_cfg["Tmin"],
             direction=anneal_cfg["direction"],
             schedule=anneal_cfg.get("schedule", "linear"),
             phase_scale=anneal_cfg.get("phase_scale", 0.4),
             start_frac=anneal_cfg.get("start_frac", 0.0),
         )
-        # Use bandwidth scheduling if available (and useful for gate_set=16)
+
         if hasattr(model, "set_layer_taus_and_bandwidths") and str(cfg.get("gate_set", "6")) == "16":
             s_cfg = cfg.get("sigma16", {})
             s_start = float(s_cfg.get("s_start", 0.25))
-            s_end = float(s_cfg.get("s_end", 0.10))
+            s_end   = float(s_cfg.get("s_end",   0.10))
             model.set_layer_taus_and_bandwidths(taus, s_start=s_start, s_end=s_end)
         else:
             model.set_layer_taus(taus)
@@ -494,8 +535,7 @@ def train_single_instance(
 
         dbg_slim = [(d[0], d[1], d[2]) for d in dbg]
         reg = regularizers_bundle(
-            dbg=dbg_slim,
-            taus=taus,
+            dbg=dbg_slim, taus=taus,
             lam_entropy=regs_cfg["lam_entropy"],
             lam_div_units=regs_cfg["lam_div_units"],
             lam_div_rows=regs_cfg["lam_div_rows"],
@@ -509,10 +549,7 @@ def train_single_instance(
             with torch.no_grad():
                 row_acc, em = per_instance_metrics(y_true, y_pred)
                 cur_val = float(em) if metric == "em" else float(row_acc)
-                if cur_val >= target:
-                    ok_streak += 1
-                else:
-                    ok_streak = 0
+                ok_streak = (ok_streak + 1) if (cur_val >= target) else 0
                 if ok_streak >= patience_checks:
                     print(f"  [early-stop] step={step+1}, metric={metric}={cur_val:.3f} (target={target})")
                     break
@@ -522,11 +559,8 @@ def train_single_instance(
         if last_dbg is None:
             y_pred, dbg = model(X)
             final_taus = make_async_taus(
-                L=len(model.layers),
-                step=steps,
-                total=steps,
-                T0=anneal_cfg["T0"],
-                Tmin=anneal_cfg["Tmin"],
+                L=len(model.layers), step=steps, total=steps,
+                T0=anneal_cfg["T0"], Tmin=anneal_cfg["Tmin"],
                 direction=anneal_cfg["direction"],
                 schedule=anneal_cfg.get("schedule", "linear"),
                 phase_scale=anneal_cfg.get("phase_scale", 0.4),
@@ -537,7 +571,6 @@ def train_single_instance(
 
         row_acc, em = per_instance_metrics(y_true, y_pred)
 
-        # composed symbolic readout -> normalize
         try:
             pred_expr_raw = compose_readout_full(B, dbg, final_taus, PRIMS_LIST)
         except Exception:
@@ -545,10 +578,8 @@ def train_single_instance(
         pred_expr = normalize_expr(pred_expr_raw)
         label_expr = normalize_expr(formula)
 
-        # equivalence == EM via truth table
         equiv = em
 
-        # simplicity / equality
         if pred_expr == label_expr:
             simpler = "same"
         else:
@@ -561,29 +592,21 @@ def train_single_instance(
             else:
                 simpler = "tie"
 
-        # gate usage from dbg
         try:
             gate_usage = extract_gate_usage_from_dbg(dbg, final_taus, PRIMS_LIST)
         except Exception:
             gate_usage = {}
 
     return {
-        "B": B,
-        "S": S,
-        "L_used": L_used,
-        "formula": label_expr,
-        "row_acc": row_acc,
-        "em": em,
-        "equiv": equiv,
-        "pred_expr": pred_expr,
-        "label_expr": label_expr,
-        "simpler": simpler,
+        "B": B, "S": S, "L_used": L_used, "formula": label_expr,
+        "row_acc": row_acc, "em": em, "equiv": equiv,
+        "pred_expr": pred_expr, "label_expr": label_expr, "simpler": simpler,
         "gate_usage": gate_usage,
         "truth_table": {
             "X": X.cpu().tolist(),
             "y_true": y_true.cpu().tolist(),
-            "y_pred": y_pred.cpu().tolist(),
-        },
+            "y_pred": y_pred.cpu().tolist()
+        }
     }
 
 
@@ -591,12 +614,12 @@ def train_single_instance(
 def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
     device = _device(cfg)
     seed_all(cfg["seed"])
-    # --- NEW: set global sigma16 behavior if using gate_set=16
+
+    # set global sigma16 behavior if using gate_set=16
     if str(cfg.get("gate_set", "6")) == "16":
         s16_cfg = cfg.get("sigma16", {})
         set_sigma16_mode(str(s16_cfg.get("mode", "rbf")))
         set_sigma16_radius(float(s16_cfg.get("radius", 0.75)))
-        # bandwidth only matters in mode='rbf'; we still keep the per-layer schedule below
 
     insts = T.load_instances_jsonl(cfg["dataset"])
 
@@ -619,40 +642,35 @@ def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
 
         res = train_single_instance(device, cfg, inst, L_override=L_override)
         results.append(res)
-        print(
-            f"[{idx+1}/{len(insts)}] B={res['B']} S={res['S']} L={res['L_used']}  "
-            f"acc={res['row_acc']:.3f}  EM={res['em']}  simpler={res['simpler']}"
-        )
+        print(f"[{idx+1}/{len(insts)}] B={res['B']} S={res['S']} L={res['L_used']}  "
+              f"acc={res['row_acc']:.3f}  EM={res['em']}  simpler={res['simpler']}")
         print(f"   label: {res['label_expr']}")
         print(f"   pred : {res['pred_expr']}")
 
     # Aggregates (macro averages across instances)
     n = max(1, len(results))
     avg_row_acc = sum(r["row_acc"] for r in results) / n
-    em_rate = sum(r["em"] for r in results) / n
-    equiv_rate = sum(r["equiv"] for r in results) / n
+    em_rate     = sum(r["em"]      for r in results) / n
+    equiv_rate  = sum(r["equiv"]   for r in results) / n
 
     # Histograms / breakdowns
     L_used_hist = Counter(r["L_used"] for r in results)
-    S_hist = Counter(r["S"] for r in results)
-    B_hist = Counter(r["B"] for r in results)
+    S_hist      = Counter(r["S"]      for r in results)
+    B_hist      = Counter(r["B"]      for r in results)
     simpler_hist = Counter(r["simpler"] for r in results)
-    # Ensure all keys are present
     for k in ["pred", "label", "tie", "same"]:
         simpler_hist.setdefault(k, 0)
     simpler_ratios = {k: simpler_hist[k] / n for k in ["pred", "label", "tie", "same"]}
 
-    print(
-        f"\nSimpler ratios: "
-        f"pred={simpler_ratios['pred']:.3f}, "
-        f"label={simpler_ratios['label']:.3f}, "
-        f"tie={simpler_ratios['tie']:.3f}, "
-        f"same={simpler_ratios['same']:.3f}"
-    )
+    print(f"\nSimpler ratios: "
+          f"pred={simpler_ratios['pred']:.3f}, "
+          f"label={simpler_ratios['label']:.3f}, "
+          f"tie={simpler_ratios['tie']:.3f}, "
+          f"same={simpler_ratios['same']:.3f}")
 
     # Aggregate gate usage across instances (so analyzer can read at run-level)
     gate_path_tot = Counter()
-    gate_all_tot = Counter()
+    gate_all_tot  = Counter()
     for r in results:
         gu = r.get("gate_usage", {})
         if isinstance(gu, dict):
@@ -706,7 +724,7 @@ def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
     device = _device(cfg)
     seed_all(cfg["seed"])
 
-    # --- NEW: set global sigma16 behavior if using gate_set=16
+    # set global sigma16 behavior if using gate_set=16
     if str(cfg.get("gate_set", "6")) == "16":
         s16_cfg = cfg.get("sigma16", {})
         set_sigma16_mode(str(s16_cfg.get("mode", "rbf")))
@@ -722,12 +740,13 @@ def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
     use_lifting = bool(lifting_cfg.get("use", True))
     lift_factor = float(lifting_cfg.get("factor", 2.0))
 
+    # resolve pair cfg robustly for B=2
+    pair_cfg = dict(cfg.get("pair", {}) or {})
+    pair_cfg = resolve_pair_cfg(pair_cfg, B=2, S=S, X=X, y_true=y_true)
+
     model = DepthStack(
-        B=2,
-        L=L,
-        S=S,
-        tau=cfg["anneal"]["T0"],
-        pair=cfg.get("pair", None),
+        B=2, L=L, S=S, tau=cfg["anneal"]["T0"],
+        pair=pair_cfg,
         gate_set=str(cfg.get("gate_set", "6")),
         use_lifting=use_lifting,
         lift_factor=lift_factor,
@@ -745,11 +764,8 @@ def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
     last_dbg = None
     for step in range(steps):
         taus = make_async_taus(
-            L=len(model.layers),
-            step=step,
-            total=steps,
-            T0=anneal_cfg["T0"],
-            Tmin=anneal_cfg["Tmin"],
+            L=len(model.layers), step=step, total=steps,
+            T0=anneal_cfg["T0"], Tmin=anneal_cfg["Tmin"],
             direction=anneal_cfg["direction"],
             schedule=anneal_cfg.get("schedule", "linear"),
             phase_scale=anneal_cfg.get("phase_scale", 0.4),
@@ -758,7 +774,7 @@ def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
         if hasattr(model, "set_layer_taus_and_bandwidths") and str(cfg.get("gate_set", "6")) == "16":
             s_cfg = cfg.get("sigma16", {})
             s_start = float(s_cfg.get("s_start", 0.25))
-            s_end = float(s_cfg.get("s_end", 0.10))
+            s_end   = float(s_cfg.get("s_end",   0.10))
             model.set_layer_taus_and_bandwidths(taus, s_start=s_start, s_end=s_end)
         else:
             model.set_layer_taus(taus)
@@ -772,8 +788,7 @@ def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
 
         dbg_slim = [(d[0], d[1], d[2]) for d in dbg]
         reg = regularizers_bundle(
-            dbg=dbg_slim,
-            taus=taus,
+            dbg=dbg_slim, taus=taus,
             lam_entropy=regs_cfg["lam_entropy"],
             lam_div_units=regs_cfg["lam_div_units"],
             lam_div_rows=regs_cfg["lam_div_rows"],
@@ -786,11 +801,8 @@ def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
         if last_dbg is None:
             y_pred, dbg = model(X)
             final_taus = make_async_taus(
-                L=len(model.layers),
-                step=steps,
-                total=steps,
-                T0=anneal_cfg["T0"],
-                Tmin=anneal_cfg["Tmin"],
+                L=len(model.layers), step=steps, total=steps,
+                T0=anneal_cfg["T0"], Tmin=anneal_cfg["Tmin"],
                 direction=anneal_cfg["direction"],
                 schedule=anneal_cfg.get("schedule", "linear"),
                 phase_scale=anneal_cfg.get("phase_scale", 0.4),
@@ -801,9 +813,7 @@ def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
 
         row_acc, em = per_instance_metrics(y_true, y_pred)
 
-        # determine PRIMS for gate usage
-        gate_set = str(cfg.get("gate_set", "6"))
-        if gate_set == "16":
+        if str(cfg.get("gate_set", "6")) == "16":
             from .boolean_prims16 import PRIMS16 as PRIMS_LIST
         else:
             from .boolean_prims import PRIMS as PRIMS_LIST
@@ -837,6 +847,7 @@ def main():
     cfg = load_config(args.config)
     if args.dataset is not None:
         cfg["dataset"] = args.dataset
+
     # Flags override config defaults
     if args.no_row_L:
         cfg["use_row_L"] = False
