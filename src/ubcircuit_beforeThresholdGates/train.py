@@ -1,13 +1,8 @@
 # src/ubcircuit/train.py
 from __future__ import annotations
-
-import argparse
-import json
-import re
+import argparse, json, re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
-
-from collections import Counter
 
 import torch
 import torch.nn as nn
@@ -55,13 +50,13 @@ DEFAULT_CFG: Dict[str, Any] = {
         "phase_scale": 0.4,
         "start_frac": 0.0
     },
-    "regs": {"lam_entropy": 1.0e-3, "lam_div_units": 5.0e-4, "lam_div_rows": 5.0e-4, "lam_const16": 5.0e-3},
+    "regs": {"lam_entropy": 1.0e-3, "lam_div_units": 5.0e-4, "lam_div_rows": 5.0e-4,"lam_const16": 5.0e-3},
     "pair": {
-        "repel": True,
-        "eta": 1.0,
-        "mode": "hard-log",   # right-pick repulsion
-        "route": "learned",   # NEW: "learned" | "mi_soft" | "mi_hard"
-    },
+                "repel": True,                 
+                "eta": 1.0, 
+                "mode": "hard-log",   # right-pick repulsion 
+                "route": "learned",   # NEW: "learned" | "mi_soft" | "mi_hard"
+            },  
     "aux": {"use": False, "lam": 1.0e-2, "wire_targets": ["AND", "NOTA"]},
     "dataset": None,  # path to JSONL with rows like {"B":int,"S":int,"L":int,"formula":str}
     "early_stop": {
@@ -87,6 +82,7 @@ def load_config(path: str | None) -> Dict[str, Any]:
     return cfg
 
 
+
 def _device(cfg) -> torch.device:
     if cfg["device"] == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -101,52 +97,6 @@ def per_instance_metrics(y_true: torch.Tensor, y_pred: torch.Tensor) -> Tuple[fl
     return row_acc, em
 
 
-# ---------- Gate usage extraction ----------
-def extract_gate_usage_from_dbg(
-    dbg: List[tuple],
-    taus: List[float],
-    PRIMS: List[str],
-) -> Dict[str, Any]:
-    """
-    Compute gate usage from dbg at the given taus.
-
-    Two notions:
-      - path_counts: only primitives actually selected by row-picks (realized circuit path)
-      - all_unit_counts: argmax primitive for every unit, regardless of row pick
-    Also saves a flat path_list in layer order.
-    """
-    path = Counter()
-    allu = Counter()
-    path_list: List[str] = []
-
-    for li, layer_dbg in enumerate(dbg):
-        outs, Lrows, unitWs, _PL, _PR = layer_dbg
-        tau = float(taus[li])
-
-        # all-unit argmax
-        for W in unitWs:
-            p = torch.softmax(W / max(tau, 1e-8), dim=0)
-            prim = PRIMS[int(p.argmax().item())]
-            allu[prim] += 1
-
-        # path: for each output row, pick the selected unit and count its primitive
-        if isinstance(Lrows, torch.Tensor) and Lrows.dim() == 2:
-            out_bits = int(Lrows.shape[0])
-            for k in range(out_bits):
-                u_idx = int(Lrows[k].argmax().item())
-                W = unitWs[u_idx]
-                p = torch.softmax(W / max(tau, 1e-8), dim=0)
-                prim = PRIMS[int(p.argmax().item())]
-                path[prim] += 1
-                path_list.append(prim)
-
-    return {
-        "path_counts": dict(path),
-        "all_unit_counts": dict(allu),
-        "path_list": path_list,
-    }
-
-
 # ---------- Expression normalization (align style with labels, NO SIMPLIFY) ----------
 # Convert arithmetic NOT to tilde form without logical simplification.
 # Examples:
@@ -159,7 +109,6 @@ _NOT_A_BARE        = re.compile(r"\(\s*1\s*-\s*a(\d+)\s*\)")
 _NOT_PARENS_ANY    = re.compile(r"\(\s*1\s*-\s*\(\s*(.+?)\s*\)\s*\)")
 _TILDE_LIT_PARENS  = re.compile(r"\(~\(\s*a(\d+)\s*\)\)")  # (~(aK)) -> (~aK)
 
-
 def _to_tilde_not(expr: str) -> str:
     s = expr
     # (1 - aK) -> (~aK)
@@ -167,71 +116,55 @@ def _to_tilde_not(expr: str) -> str:
     # (1 - (X)) -> (~(X))  (repeat a few times to catch nesting)
     for _ in range(8):
         s2 = _NOT_PARENS_ANY.sub(r"(~(\1))", s)
-        if s2 == s:
-            break
+        if s2 == s: break
         s = s2
     # (~(aK)) -> (~aK) (cosmetic)
     s = _TILDE_LIT_PARENS.sub(r"(~a\1)", s)
     return s
-
 
 def _balance_parens(expr: str) -> str:
     out = []
     depth = 0
     for ch in expr:
         if ch == "(":
-            depth += 1
-            out.append(ch)
+            depth += 1; out.append(ch)
         elif ch == ")":
             if depth > 0:
-                depth -= 1
-                out.append(ch)
+                depth -= 1; out.append(ch)
         else:
             out.append(ch)
     if depth > 0:
         tmp = []
         for ch in reversed(out):
             if ch == "(" and depth > 0:
-                depth -= 1
-                continue
+                depth -= 1; continue
             tmp.append(ch)
         out = list(reversed(tmp))
     return "".join(out)
 
-
 def _strip_outer_parens(expr: str) -> str:
     s = expr.strip()
-    if not (s.startswith("(") and s.endswith(")")):
-        return s
+    if not (s.startswith("(") and s.endswith(")")): return s
     depth = 0
     for i, ch in enumerate(s):
-        if ch == "(":
-            depth += 1
+        if ch == "(": depth += 1
         elif ch == ")":
             depth -= 1
-            if depth == 0 and i != len(s) - 1:
-                return s
+            if depth == 0 and i != len(s)-1: return s
     return s[1:-1].strip()
-
 
 def _force_balance_counts(expr: str) -> str:
     s = expr
-    opens = s.count("(")
-    closes = s.count(")")
+    opens = s.count("("); closes = s.count(")")
     while closes > opens:
         j = s.rfind(")")
-        if j < 0:
-            break
-        s = s[:j] + s[j + 1:]
-        closes -= 1
+        if j < 0: break
+        s = s[:j] + s[j+1:]; closes -= 1
     while opens > closes:
         i = s.find("(")
-        if i < 0:
-            break
-        s = s[:i] + s[i + 1:]
-        opens -= 1
+        if i < 0: break
+        s = s[:i] + s[i+1:]; opens -= 1
     return s
-
 
 def _canonical_spaces(expr: str) -> str:
     s = re.sub(r"\s+", " ", expr).strip()
@@ -242,10 +175,8 @@ def _canonical_spaces(expr: str) -> str:
     s = re.sub(r"~\s*a", "~a", s)
     return s
 
-
 def normalize_expr(expr: str) -> str:
-    if not expr:
-        return expr
+    if not expr: return expr
     s = _to_tilde_not(expr)   # NO simplification beyond formatting to tilde form
     s = _balance_parens(s)
     s = _force_balance_counts(s)
@@ -253,65 +184,59 @@ def normalize_expr(expr: str) -> str:
     s = _canonical_spaces(s)
     return s
 
-
 def expr_complexity(expr: str) -> Tuple[int, int]:
     s = expr.replace(" ", "")
     char_len = len(s)
     num_vars = len(re.findall(r"a\d+", s))
-    num_ops = s.count("&") + s.count("|") + s.count("~")
+    num_ops  = s.count("&") + s.count("|") + s.count("~")
     token_score = num_vars + num_ops
     return char_len, token_score
 
 
 # ---------- Layer-by-layer composed symbolic readout ----------
+
+# def _apply_prim_to_syms(prim: str, a_sym: str, b_sym: str) -> str:
+#     # No extra parens around single literals inside &, |; group the whole binary op.
+#     if prim.startswith("AND"):       # "AND(a,b)=min"
+#         return f"({a_sym} & {b_sym})"
+#     if prim.startswith("OR"):        # "OR(a,b)=max"
+#         return f"({a_sym} | {b_sym})"
+#     if prim.startswith("NOT(a)"):
+#         return f"(1 - {a_sym})"
+#     if prim.startswith("NOT(b)"):
+#         return f"(1 - {b_sym})"
+#     if prim.startswith("a (skip)"):
+#         return f"{a_sym}"
+#     if prim.startswith("b (skip)"):
+#         return f"{b_sym}"
+#     return f"({a_sym} | {b_sym})"  # fallback
+
 def _apply_prim_to_syms(prim: str, a_sym: str, b_sym: str) -> str:
     # ---- legacy 6 features
-    if prim.startswith("AND"):
-        return f"({a_sym} & {b_sym})"
-    if prim.startswith("OR("):
-        return f"({a_sym} | {b_sym})"
-    if prim.startswith("NOT(a)"):
-        return f"(1 - {a_sym})"
-    if prim.startswith("NOT(b)"):
-        return f"(1 - {b_sym})"
-    if prim.startswith("a (skip)"):
-        return f"{a_sym}"
-    if prim.startswith("b (skip)"):
-        return f"{b_sym}"
+    if prim.startswith("AND"):        return f"({a_sym} & {b_sym})"
+    if prim.startswith("OR("):        return f"({a_sym} | {b_sym})"
+    if prim.startswith("NOT(a)"):     return f"(1 - {a_sym})"
+    if prim.startswith("NOT(b)"):     return f"(1 - {b_sym})"
+    if prim.startswith("a (skip)"):   return f"{a_sym}"
+    if prim.startswith("b (skip)"):   return f"{b_sym}"
 
     # ---- 16-gate names
-    if prim == "FALSE":
-        return "0"
-    if prim == "TRUE":
-        return "1"
-    if prim == "A":
-        return f"{a_sym}"
-    if prim == "B":
-        return f"{b_sym}"
-    if prim == "~A":
-        return f"(1 - {a_sym})"
-    if prim == "~B":
-        return f"(1 - {b_sym})"
-    if prim == "AND":
-        return f"({a_sym} & {b_sym})"
-    if prim == "OR":
-        return f"({a_sym} | {b_sym})"
-    if prim == "XOR":
-        return f"(({a_sym} & (1 - {b_sym})) | ((1 - {a_sym}) & {b_sym}))"
-    if prim == "XNOR":
-        return f"(1 - (({a_sym} & (1 - {b_sym})) | ((1 - {a_sym}) & {b_sym})))"
-    if prim == "NAND":
-        return f"(1 - ({a_sym} & {b_sym}))"
-    if prim == "NOR":
-        return f"(1 - ({a_sym} | {b_sym}))"
-    if prim == "A&~B":
-        return f"({a_sym} & (1 - {b_sym}))"
-    if prim == "~A&B":
-        return f"((1 - {a_sym}) & {b_sym})"
-    if prim == "A|~B":
-        return f"({a_sym} | (1 - {b_sym}))"
-    if prim == "~A|B":
-        return f"((1 - {a_sym}) | {b_sym})"
+    if prim == "FALSE":    return "0"
+    if prim == "TRUE":     return "1"
+    if prim == "A":        return f"{a_sym}"
+    if prim == "B":        return f"{b_sym}"
+    if prim == "~A":       return f"(1 - {a_sym})"
+    if prim == "~B":       return f"(1 - {b_sym})"
+    if prim == "AND":      return f"({a_sym} & {b_sym})"
+    if prim == "OR":       return f"({a_sym} | {b_sym})"
+    if prim == "XOR":      return f"(({a_sym} & (1 - {b_sym})) | ((1 - {a_sym}) & {b_sym}))"
+    if prim == "XNOR":     return f"(1 - (({a_sym} & (1 - {b_sym})) | ((1 - {a_sym}) & {b_sym})))"
+    if prim == "NAND":     return f"(1 - ({a_sym} & {b_sym}))"
+    if prim == "NOR":      return f"(1 - ({a_sym} | {b_sym}))"
+    if prim == "A&~B":     return f"({a_sym} & (1 - {b_sym}))"
+    if prim == "~A&B":     return f"((1 - {a_sym}) & {b_sym})"
+    if prim == "A|~B":     return f"({a_sym} | (1 - {b_sym}))"
+    if prim == "~A|B":     return f"((1 - {a_sym}) | {b_sym})"
 
     # Fallback
     return f"({a_sym} | {b_sym})"
@@ -321,10 +246,8 @@ def _argmax_unit_primitive(unitW: torch.Tensor, tau: float, PRIMS: List[str]) ->
     p = torch.softmax(unitW / max(tau, 1e-8), dim=0)
     return PRIMS[int(p.argmax().item())]
 
-
 def _argmax_row_pick(L_row: torch.Tensor) -> int:
     return int(L_row.argmax().item())
-
 
 def compose_readout_full(
     B: int,
@@ -345,9 +268,10 @@ def compose_readout_full(
     else:
         PLp = torch.softmax(PL0 / max(tau0, 1e-8), dim=-1).detach()
         PRp = torch.softmax(PR0 / max(tau0, 1e-8), dim=-1).detach()
-        left_idx = PLp.argmax(dim=1).tolist()
+        left_idx  = PLp.argmax(dim=1).tolist()
         right_idx = PRp.argmax(dim=1).tolist()
         pair_syms = [(base_syms[i], base_syms[j]) for i, j in zip(left_idx, right_idx)]
+
 
     unit_exprs = []
     for s, W in enumerate(unitWs0):
@@ -386,18 +310,18 @@ def compose_readout_full(
 
 
 # ---------- Training (single instance) ----------
+
 def train_single_instance(
     device,
     cfg: Dict[str, Any],
     inst: Dict[str, Any],
     L_override: Optional[int] = None,
 ) -> Dict[str, Any]:
-    B = int(inst["B"])
-    S = int(inst["S"])
-    formula = str(inst["formula"])
-    X, y_true = T.truth_table_from_formula(B, formula)
-    X = X.to(device)
-    y_true = y_true.to(device)
+    #from .boolean_prims import PRIMS as PRIMS_LIST
+
+    B = int(inst["B"]); S = int(inst["S"]); formula = str(inst["formula"])
+    X, y_true = T.truth_table_from_formula(B, formula)    
+    X = X.to(device); y_true = y_true.to(device)
 
     # ---- Resolve L, temps, gate set ----
     if L_override is not None:
@@ -419,9 +343,10 @@ def train_single_instance(
     pair_cfg = dict(cfg.get("pair", {}))  # copy
     route = str(pair_cfg.get("route", "learned"))
     if (B > 2) and route in {"mi_soft", "mi_hard"}:
+        from .mi import top_mi_pairs, priors_from_pairs
         pairs = top_mi_pairs(X, y_true, S=S, disjoint=bool(pair_cfg.get("mi_disjoint", True)))
         if route == "mi_hard":
-            pair_cfg["fixed_pairs"] = pairs  # for FixedPairSelector in GeneralLayer
+            pair_cfg["fixed_pairs"] = pairs                           # for FixedPairSelector in GeneralLayer
         else:  # mi_soft
             PLp, PRp = priors_from_pairs(pairs, B)
             pair_cfg["PL_prior"] = PLp.tolist()
@@ -433,26 +358,19 @@ def train_single_instance(
     lift_factor = float(lifting_cfg.get("factor", 2.0))
 
     # ---- Build model with the (possibly) augmented pair_cfg ----
-    model = DepthStack(
-        B=B,
-        L=L_used,
-        S=S,
-        tau=T0,
-        pair=pair_cfg,
-        gate_set=gate_set,
-        use_lifting=use_lifting,
-        lift_factor=lift_factor,
-    ).to(device)
+    model = DepthStack(B=B, L=L_used, S=S, tau=T0,
+                    pair=pair_cfg,
+                    gate_set=gate_set,
+                    use_lifting=use_lifting,
+                    lift_factor=lift_factor,
+                    ).to(device)
+
 
     opt_name = str(cfg["optimizer"]).lower()
-    opt = (
-        optim.RMSprop(model.parameters(), lr=cfg["lr"], alpha=0.99, eps=1e-8)
-        if opt_name == "rmsprop"
-        else optim.Adam(model.parameters(), lr=cfg["lr"])
-    )
-    steps = int(cfg["steps"])
-    regs_cfg = cfg["regs"]
-    anneal_cfg = cfg["anneal"]
+    opt = (optim.RMSprop(model.parameters(), lr=cfg["lr"], alpha=0.99, eps=1e-8)
+           if opt_name == "rmsprop" else
+           optim.Adam(model.parameters(), lr=cfg["lr"]))
+    steps = int(cfg["steps"]); regs_cfg = cfg["regs"]; anneal_cfg = cfg["anneal"]
 
     es_cfg = cfg.get("early_stop", {})
     use_es = bool(es_cfg.get("use", False))
@@ -466,21 +384,18 @@ def train_single_instance(
     last_dbg = None
     for step in range(steps):
         taus = make_async_taus(
-            L=len(model.layers),
-            step=step,
-            total=steps,
-            T0=anneal_cfg["T0"],
-            Tmin=anneal_cfg["Tmin"],
+            L=len(model.layers), step=step, total=steps,
+            T0=anneal_cfg["T0"], Tmin=anneal_cfg["Tmin"],
             direction=anneal_cfg["direction"],
             schedule=anneal_cfg.get("schedule", "linear"),
             phase_scale=anneal_cfg.get("phase_scale", 0.4),
             start_frac=anneal_cfg.get("start_frac", 0.0),
         )
         # Use bandwidth scheduling if available (and useful for gate_set=16)
-        if hasattr(model, "set_layer_taus_and_bandwidths") and str(cfg.get("gate_set", "6")) == "16":
+        if hasattr(model, "set_layer_taus_and_bandwidths") and str(cfg.get("gate_set","6")) == "16":
             s_cfg = cfg.get("sigma16", {})
             s_start = float(s_cfg.get("s_start", 0.25))
-            s_end = float(s_cfg.get("s_end", 0.10))
+            s_end   = float(s_cfg.get("s_end",   0.10))
             model.set_layer_taus_and_bandwidths(taus, s_start=s_start, s_end=s_end)
         else:
             model.set_layer_taus(taus)
@@ -494,8 +409,7 @@ def train_single_instance(
 
         dbg_slim = [(d[0], d[1], d[2]) for d in dbg]
         reg = regularizers_bundle(
-            dbg=dbg_slim,
-            taus=taus,
+            dbg=dbg_slim, taus=taus,
             lam_entropy=regs_cfg["lam_entropy"],
             lam_div_units=regs_cfg["lam_div_units"],
             lam_div_rows=regs_cfg["lam_div_rows"],
@@ -522,11 +436,8 @@ def train_single_instance(
         if last_dbg is None:
             y_pred, dbg = model(X)
             final_taus = make_async_taus(
-                L=len(model.layers),
-                step=steps,
-                total=steps,
-                T0=anneal_cfg["T0"],
-                Tmin=anneal_cfg["Tmin"],
+                L=len(model.layers), step=steps, total=steps,
+                T0=anneal_cfg["T0"], Tmin=anneal_cfg["Tmin"],
                 direction=anneal_cfg["direction"],
                 schedule=anneal_cfg.get("schedule", "linear"),
                 phase_scale=anneal_cfg.get("phase_scale", 0.4),
@@ -561,36 +472,22 @@ def train_single_instance(
             else:
                 simpler = "tie"
 
-        # gate usage from dbg
-        try:
-            gate_usage = extract_gate_usage_from_dbg(dbg, final_taus, PRIMS_LIST)
-        except Exception:
-            gate_usage = {}
-
     return {
-        "B": B,
-        "S": S,
-        "L_used": L_used,
-        "formula": label_expr,
-        "row_acc": row_acc,
-        "em": em,
-        "equiv": equiv,
-        "pred_expr": pred_expr,
-        "label_expr": label_expr,
-        "simpler": simpler,
-        "gate_usage": gate_usage,
+        "B": B, "S": S, "L_used": L_used, "formula": label_expr,
+        "row_acc": row_acc, "em": em, "equiv": equiv,
+        "pred_expr": pred_expr, "label_expr": label_expr, "simpler": simpler,
         "truth_table": {
             "X": X.cpu().tolist(),
             "y_true": y_true.cpu().tolist(),
-            "y_pred": y_pred.cpu().tolist(),
-        },
+            "y_pred": y_pred.cpu().tolist()
+        }
     }
 
 
 # ---------- Dataset runner ----------
+
 def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
-    device = _device(cfg)
-    seed_all(cfg["seed"])
+    device = _device(cfg); seed_all(cfg["seed"])
     # --- NEW: set global sigma16 behavior if using gate_set=16
     if str(cfg.get("gate_set", "6")) == "16":
         s16_cfg = cfg.get("sigma16", {})
@@ -619,49 +516,33 @@ def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
 
         res = train_single_instance(device, cfg, inst, L_override=L_override)
         results.append(res)
-        print(
-            f"[{idx+1}/{len(insts)}] B={res['B']} S={res['S']} L={res['L_used']}  "
-            f"acc={res['row_acc']:.3f}  EM={res['em']}  simpler={res['simpler']}"
-        )
+        print(f"[{idx+1}/{len(insts)}] B={res['B']} S={res['S']} L={res['L_used']}  "
+              f"acc={res['row_acc']:.3f}  EM={res['em']}  simpler={res['simpler']}")
         print(f"   label: {res['label_expr']}")
         print(f"   pred : {res['pred_expr']}")
 
     # Aggregates (macro averages across instances)
     n = max(1, len(results))
     avg_row_acc = sum(r["row_acc"] for r in results) / n
-    em_rate = sum(r["em"] for r in results) / n
-    equiv_rate = sum(r["equiv"] for r in results) / n
+    em_rate     = sum(r["em"]      for r in results) / n
+    equiv_rate  = sum(r["equiv"]   for r in results) / n
 
     # Histograms / breakdowns
+    from collections import Counter
     L_used_hist = Counter(r["L_used"] for r in results)
-    S_hist = Counter(r["S"] for r in results)
-    B_hist = Counter(r["B"] for r in results)
+    S_hist      = Counter(r["S"]      for r in results)
+    B_hist      = Counter(r["B"]      for r in results)
     simpler_hist = Counter(r["simpler"] for r in results)
     # Ensure all keys are present
     for k in ["pred", "label", "tie", "same"]:
         simpler_hist.setdefault(k, 0)
     simpler_ratios = {k: simpler_hist[k] / n for k in ["pred", "label", "tie", "same"]}
 
-    print(
-        f"\nSimpler ratios: "
-        f"pred={simpler_ratios['pred']:.3f}, "
-        f"label={simpler_ratios['label']:.3f}, "
-        f"tie={simpler_ratios['tie']:.3f}, "
-        f"same={simpler_ratios['same']:.3f}"
-    )
-
-    # Aggregate gate usage across instances (so analyzer can read at run-level)
-    gate_path_tot = Counter()
-    gate_all_tot = Counter()
-    for r in results:
-        gu = r.get("gate_usage", {})
-        if isinstance(gu, dict):
-            pc = gu.get("path_counts", {})
-            ac = gu.get("all_unit_counts", {})
-            if isinstance(pc, dict):
-                gate_path_tot.update({k: int(v) for k, v in pc.items()})
-            if isinstance(ac, dict):
-                gate_all_tot.update({k: int(v) for k, v in ac.items()})
+    print(f"\nSimpler ratios: "
+          f"pred={simpler_ratios['pred']:.3f}, "
+          f"label={simpler_ratios['label']:.3f}, "
+          f"tie={simpler_ratios['tie']:.3f}, "
+          f"same={simpler_ratios['same']:.3f}")
 
     # Dataset-aware config snapshot
     cfg_eff = dict(cfg)
@@ -690,22 +571,19 @@ def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
             "counts": {k: simpler_hist[k] for k in ["pred", "label", "tie", "same"]},
             "ratios": simpler_ratios,
         },
-        "gate_usage": {
-            "path_counts": dict(gate_path_tot),
-            "all_unit_counts": dict(gate_all_tot),
-        },
-        "results": results,
+        "results": results
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     print(f"\nSaved summary to: {out_dir / 'summary.json'}")
     return summary
 
 
-# ---------- Single-task fallback (B=2) ----------
-def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
-    device = _device(cfg)
-    seed_all(cfg["seed"])
 
+# ---------- Single-task fallback (B=2) ----------
+
+def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
+    device = _device(cfg); seed_all(cfg["seed"])
+    
     # --- NEW: set global sigma16 behavior if using gate_set=16
     if str(cfg.get("gate_set", "6")) == "16":
         s16_cfg = cfg.get("sigma16", {})
@@ -713,67 +591,52 @@ def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
         set_sigma16_radius(float(s16_cfg.get("radius", 0.75)))
 
     X, y_true = T.make_truth_table(cfg["task"])
-    X = X.to(device)
-    y_true = y_true.to(device)
+    X = X.to(device); y_true = y_true.to(device)
 
-    L, S = int(cfg["L"]), int(cfg["S"])
+    L, S = int(cfg["L"]), int(cfg["S"])    
+    #model = DepthStack(B=2, L=L, S=S, tau=cfg["anneal"]["T0"], pair=cfg.get("pair", None)).to(device)
 
     lifting_cfg = cfg.get("lifting", {})
     use_lifting = bool(lifting_cfg.get("use", True))
     lift_factor = float(lifting_cfg.get("factor", 2.0))
 
-    model = DepthStack(
-        B=2,
-        L=L,
-        S=S,
-        tau=cfg["anneal"]["T0"],
-        pair=cfg.get("pair", None),
-        gate_set=str(cfg.get("gate_set", "6")),
-        use_lifting=use_lifting,
-        lift_factor=lift_factor,
-    ).to(device)
+    model = DepthStack(B=2, L=L, S=S, tau=cfg["anneal"]["T0"],
+                   pair=cfg.get("pair", None),
+                   gate_set=str(cfg.get("gate_set","6")),                   
+                   use_lifting=use_lifting,
+                   lift_factor=lift_factor,
+                   ).to(device)
 
-    opt = (
-        optim.RMSprop(model.parameters(), lr=cfg["lr"], alpha=0.99, eps=1e-8)
-        if cfg["optimizer"].lower() == "rmsprop"
-        else optim.Adam(model.parameters(), lr=cfg["lr"])
-    )
-    steps = int(cfg["steps"])
-    regs_cfg = cfg["regs"]
-    anneal_cfg = cfg["anneal"]
+    opt = (optim.RMSprop(model.parameters(), lr=cfg["lr"], alpha=0.99, eps=1e-8)
+           if cfg["optimizer"].lower() == "rmsprop" else
+           optim.Adam(model.parameters(), lr=cfg["lr"]))
+    steps = int(cfg["steps"]); regs_cfg = cfg["regs"]; anneal_cfg = cfg["anneal"]
 
-    last_dbg = None
     for step in range(steps):
         taus = make_async_taus(
-            L=len(model.layers),
-            step=step,
-            total=steps,
-            T0=anneal_cfg["T0"],
-            Tmin=anneal_cfg["Tmin"],
+            L=len(model.layers), step=step, total=steps,
+            T0=anneal_cfg["T0"], Tmin=anneal_cfg["Tmin"],
             direction=anneal_cfg["direction"],
             schedule=anneal_cfg.get("schedule", "linear"),
             phase_scale=anneal_cfg.get("phase_scale", 0.4),
             start_frac=anneal_cfg.get("start_frac", 0.0),
         )
-        if hasattr(model, "set_layer_taus_and_bandwidths") and str(cfg.get("gate_set", "6")) == "16":
+        if hasattr(model, "set_layer_taus_and_bandwidths") and str(cfg.get("gate_set","6")) == "16":
             s_cfg = cfg.get("sigma16", {})
             s_start = float(s_cfg.get("s_start", 0.25))
-            s_end = float(s_cfg.get("s_end", 0.10))
+            s_end   = float(s_cfg.get("s_end",   0.10))
             model.set_layer_taus_and_bandwidths(taus, s_start=s_start, s_end=s_end)
         else:
             model.set_layer_taus(taus)
 
         opt.zero_grad()
         y_pred, dbg = model(X)
-        last_dbg = (y_pred, dbg, taus)
-
         assert torch.all((y_true >= 0) & (y_true <= 1)), "Targets must be in [0,1]"
         loss = safe_bce(y_pred, y_true)
 
         dbg_slim = [(d[0], d[1], d[2]) for d in dbg]
         reg = regularizers_bundle(
-            dbg=dbg_slim,
-            taus=taus,
+            dbg=dbg_slim, taus=taus,
             lam_entropy=regs_cfg["lam_entropy"],
             lam_div_units=regs_cfg["lam_div_units"],
             lam_div_rows=regs_cfg["lam_div_rows"],
@@ -783,38 +646,11 @@ def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
         opt.step()
 
     with torch.no_grad():
-        if last_dbg is None:
-            y_pred, dbg = model(X)
-            final_taus = make_async_taus(
-                L=len(model.layers),
-                step=steps,
-                total=steps,
-                T0=anneal_cfg["T0"],
-                Tmin=anneal_cfg["Tmin"],
-                direction=anneal_cfg["direction"],
-                schedule=anneal_cfg.get("schedule", "linear"),
-                phase_scale=anneal_cfg.get("phase_scale", 0.4),
-                start_frac=anneal_cfg.get("start_frac", 0.0),
-            )
-        else:
-            y_pred, dbg, final_taus = last_dbg
-
+        y_pred, _ = model(X)
         row_acc, em = per_instance_metrics(y_true, y_pred)
 
-        # determine PRIMS for gate usage
-        gate_set = str(cfg.get("gate_set", "6"))
-        if gate_set == "16":
-            from .boolean_prims16 import PRIMS16 as PRIMS_LIST
-        else:
-            from .boolean_prims import PRIMS as PRIMS_LIST
-
-        try:
-            gate_usage = extract_gate_usage_from_dbg(dbg, final_taus, PRIMS_LIST)
-        except Exception:
-            gate_usage = {}
-
     out_dir.mkdir(parents=True, exist_ok=True)
-    summary = {"config": cfg, "row_acc": row_acc, "em": em, "gate_usage": gate_usage}
+    summary = {"config": cfg, "row_acc": row_acc, "em": em}
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     print(f"\nSaved summary to: {out_dir / 'summary.json'}")
     return summary
