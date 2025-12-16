@@ -93,7 +93,6 @@ TMPDIR_USE="${SLURM_TMPDIR:-/tmp}"
 mkdir -p "${TMPDIR_USE}"
 CFG="${TMPDIR_USE}/cfg_joint_bnr_seed${SEED}.yaml"
 
-# Config is shared across match modes; match mode is CLI arg
 {
   echo "seed: ${SEED}"
   echo "gate_set: \"${GATE_SET}\""
@@ -103,7 +102,6 @@ CFG="${TMPDIR_USE}/cfg_joint_bnr_seed${SEED}.yaml"
   echo "use_row_L: true"
   echo "use_max_L: false"
 
-  # ---- FORCE NO LIFTING (as before) ----
   echo "lifting:"
   echo "  use: false"
   echo "  factor: 2.0"
@@ -161,7 +159,6 @@ python -m ubcircuit.joint_mlp_ubc_bnr \
   --out_dir "${RUN_DIR}" \
   --mlp_match "${MATCH}" \
   --S_op add --S_k "${S_ADD}" --S_min 2 --S_max 128 \
-  --L_op add --L_k "${L_ADD}" --L_min 2 --L_max 16 \
-  --save_ckpts
+  --L_op add --L_k "${L_ADD}" --L_min 2 --L_max 16
 
 echo "[ok] done. summary: ${RUN_DIR}/summary.json"
