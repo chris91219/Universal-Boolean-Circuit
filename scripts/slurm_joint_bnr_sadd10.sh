@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ubc_joint_bnr_Sadd10
 #SBATCH --account=def-ssanner
-#SBATCH --time=0-10:00:00
+#SBATCH --time=0-12:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --array=0-14

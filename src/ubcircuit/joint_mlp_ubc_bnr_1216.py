@@ -1,21 +1,37 @@
 #!/usr/bin/env python3
 """
-Joint train UBC + MLP per instance, with:
-- MLP match: neuron | param_soft | param_total
-- UBC decode expr + gate usage
-- MLP: BNR exact/eps per layer, primitive recoverability per layer, gate histograms
-- Output: results.jsonl, expr_table.csv, summary.json
+Train UBC + MLP together per-instance, support:
+  - MLP match modes: neuron | param_soft | param_total
+  - UBC gate-set 6 or 16
+  - MI routing etc. via train.resolve_pair_cfg
+  - Expression decoding:
+      * UBC: hard-decode a symbolic expression from dbg (argmax routing + argmax gate)
+      * MLP: extract a boolean-circuit expression from binarized activations (greedy gate fit)
+  - Interpretability diagnostics for MLP:
+      * BNR_exact_per_layer, BNR_eps_per_layer
+      * primitive_hit_rate_L1 (literal or 16-gate over INPUT bits)
+      * mean_best_primitive_acc_L1
+
+Comparison:
+  - EM correctness (truth-table exact match)
+  - Rough expression length comparison (char + token counts), NOT semantic equivalence.
+
+Outputs under out_dir:
+  - results.jsonl    per-instance records
+  - expr_table.csv   table with label/ubc/mlp expressions + lengths + interpretability metrics
+  - summary.json     aggregates
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -33,9 +49,10 @@ from .train import (
     extract_gate_usage_from_dbg,
 )
 
-# -----------------------------
-# Expr normalize + complexity
-# -----------------------------
+# ------------------------------------------------------------
+# Expression normalization + cheap complexity
+# ------------------------------------------------------------
+
 _NOT_A_BARE        = re.compile(r"\(\s*1\s*-\s*a(\d+)\s*\)")
 _NOT_PARENS_ANY    = re.compile(r"\(\s*1\s*-\s*\(\s*(.+?)\s*\)\s*\)")
 _TILDE_LIT_PARENS  = re.compile(r"\(~\(\s*a(\d+)\s*\)\)")
@@ -107,6 +124,7 @@ def normalize_expr(expr: str) -> str:
     return s
 
 def expr_complexity(expr: str) -> Tuple[int, int]:
+    """(char_len, token_score) where token_score = #vars + #ops"""
     s = (expr or "").replace(" ", "")
     char_len = len(s)
     num_vars = len(re.findall(r"a\d+", s))
@@ -114,48 +132,73 @@ def expr_complexity(expr: str) -> Tuple[int, int]:
     return char_len, num_vars + num_ops
 
 
-# -----------------------------
-# Param counting + MLP
-# -----------------------------
+# ------------------------------------------------------------
+# Param counting & MLP builder
+# ------------------------------------------------------------
+
 def count_trainable_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-def ubc_param_counts(B: int, S: int, L_used: int, gate_set: str,
-                     pair_cfg: Dict[str, Any], tau0: float,
-                     use_lifting: bool, lift_factor: float) -> Tuple[int, int]:
+def ubc_param_counts(
+    B: int,
+    S: int,
+    L_used: int,
+    gate_set: str,
+    pair_cfg: Dict[str, Any],
+    tau0: float,
+    use_lifting: bool,
+    lift_factor: float,
+) -> Tuple[int, int]:
     pair_cfg = dict(pair_cfg or {})
     pair_cfg["route"] = "learned"
-    model = DepthStack(B=B, L=L_used, S=S, tau=tau0,
-                       pair=pair_cfg, gate_set=gate_set,
-                       use_lifting=use_lifting, lift_factor=lift_factor)
+    model = DepthStack(
+        B=B, L=L_used, S=S, tau=tau0,
+        pair=pair_cfg, gate_set=gate_set,
+        use_lifting=use_lifting, lift_factor=lift_factor,
+    )
     n_soft = count_trainable_params(model)
     K = 16 if gate_set == "16" else 6
     n_fixed = (L_used * S) * K
     return n_soft, n_soft + n_fixed
 
+
 class TruthTableMLPActs(nn.Module):
+    """
+    MLP that returns hidden activations after each ReLU (for interpretability).
+    depth = # hidden layers.
+    """
     def __init__(self, in_bits: int, hidden_dim: int, depth: int):
         super().__init__()
+        self.in_bits = int(in_bits)
+        self.hidden_dim = int(hidden_dim)
+        self.depth = int(depth)
+
         self.linears = nn.ModuleList()
-        last = int(in_bits)
-        hidden_dim = int(hidden_dim)
-        depth = int(depth)
-        for _ in range(depth):
-            self.linears.append(nn.Linear(last, hidden_dim))
-            last = hidden_dim
+        last = self.in_bits
+        for _ in range(self.depth):
+            self.linears.append(nn.Linear(last, self.hidden_dim))
+            last = self.hidden_dim
         self.out = nn.Linear(last, 1)
 
     def forward(self, x: torch.Tensor, return_acts: bool = False):
-        acts = []
+        acts: List[torch.Tensor] = []
         h = x
         for lin in self.linears:
             h = torch.relu(lin(h))
             acts.append(h)
         y = torch.sigmoid(self.out(h))
-        return (y, acts) if return_acts else y
+        if return_acts:
+            return y, acts
+        return y
 
-def build_mlp_param_matched(B: int, depth: int, target_params: int,
-                            min_hidden: int = 1, max_hidden: int = 2048) -> Tuple[TruthTableMLPActs, int]:
+
+def build_mlp_param_matched(
+    B: int,
+    depth: int,
+    target_params: int,
+    min_hidden: int = 1,
+    max_hidden: int = 2048
+) -> Tuple[TruthTableMLPActs, int]:
     best_m = None
     best_n = -1
     for h in range(min_hidden, max_hidden + 1):
@@ -163,19 +206,22 @@ def build_mlp_param_matched(B: int, depth: int, target_params: int,
         n = count_trainable_params(m)
         if n <= target_params:
             if n > best_n:
-                best_n, best_m = n, m
+                best_n = n
+                best_m = m
         else:
             if best_m is not None:
                 break
-            best_m, best_n = m, n
+            best_m = m
+            best_n = n
             break
     assert best_m is not None
     return best_m, best_n
 
 
-# -----------------------------
-# Scaling
-# -----------------------------
+# ------------------------------------------------------------
+# Scaling helpers (CLI S_add/L_add like your sweep)
+# ------------------------------------------------------------
+
 def apply_scale(val: int, op: str, k: int, vmin: int, vmax: int) -> int:
     op = str(op).lower()
     if op == "none":
@@ -189,9 +235,10 @@ def apply_scale(val: int, op: str, k: int, vmin: int, vmax: int) -> int:
     return int(max(vmin, min(vmax, out)))
 
 
-# -----------------------------
-# UBC decode
-# -----------------------------
+# ------------------------------------------------------------
+# UBC expression decoding from dbg
+# ------------------------------------------------------------
+
 def _argmax_unit_primitive(unitW: torch.Tensor, tau: float, PRIMS: List[str]) -> str:
     p = torch.softmax(unitW / max(tau, 1e-8), dim=0)
     return PRIMS[int(p.argmax().item())]
@@ -203,13 +250,21 @@ def _not_expr(e: str) -> str:
     return f"(~({e}))"
 
 def _apply_prim_to_syms(prim: str, a_sym: str, b_sym: str) -> str:
-    if prim.startswith("AND"): return f"({a_sym} & {b_sym})"
-    if prim.startswith("OR"):  return f"({a_sym} | {b_sym})"
-    if prim.startswith("NOT(a)"): return _not_expr(a_sym)
-    if prim.startswith("NOT(b)"): return _not_expr(b_sym)
-    if prim.startswith("a (skip)"): return f"{a_sym}"
-    if prim.startswith("b (skip)"): return f"{b_sym}"
+    # legacy 6
+    if prim.startswith("AND"):
+        return f"({a_sym} & {b_sym})"
+    if prim.startswith("OR"):
+        return f"({a_sym} | {b_sym})"
+    if prim.startswith("NOT(a)"):
+        return _not_expr(a_sym)
+    if prim.startswith("NOT(b)"):
+        return _not_expr(b_sym)
+    if prim.startswith("a (skip)"):
+        return f"{a_sym}"
+    if prim.startswith("b (skip)"):
+        return f"{b_sym}"
 
+    # 16
     if prim == "FALSE": return "0"
     if prim == "TRUE":  return "1"
     if prim == "A":     return f"{a_sym}"
@@ -229,10 +284,18 @@ def _apply_prim_to_syms(prim: str, a_sym: str, b_sym: str) -> str:
     if prim == "XNOR":
         return _not_expr(f"(({a_sym} & {_not_expr(b_sym)}) | ({_not_expr(a_sym)} & {b_sym}))")
 
+    # fallback
     return f"({a_sym} | {b_sym})"
 
-def compose_readout_ubc(B: int, dbg: List[tuple], final_taus: List[float], PRIMS: List[str]) -> str:
+
+def compose_readout_ubc(
+    B: int,
+    dbg: List[tuple],
+    final_taus: List[float],
+    PRIMS: List[str],
+) -> str:
     base_syms = [f"a{i}" for i in range(B)]
+
     outs0, Lrows0, unitWs0, PL0, PR0 = dbg[0]
     tau0 = float(final_taus[0])
 
@@ -250,7 +313,7 @@ def compose_readout_ubc(B: int, dbg: List[tuple], final_taus: List[float], PRIMS
         unit_exprs.append(_apply_prim_to_syms(prim, a_sym, b_sym))
 
     wires = []
-    for k in range(Lrows0.shape[0]):
+    for k in range(Lrows0.shape[0]):  # out_bits = 2
         u_idx = _argmax_row_pick(Lrows0[k])
         wires.append(unit_exprs[u_idx])
 
@@ -262,7 +325,7 @@ def compose_readout_ubc(B: int, dbg: List[tuple], final_taus: List[float], PRIMS
             prim = _argmax_unit_primitive(W, tau, PRIMS)
             unit_exprs.append(_apply_prim_to_syms(prim, wires[0], wires[1]))
         new_wires = []
-        for k in range(Lrows.shape[0]):
+        for k in range(Lrows.shape[0]):  # out_bits = 2
             u_idx = _argmax_row_pick(Lrows[k])
             new_wires.append(unit_exprs[u_idx])
         wires = new_wires
@@ -277,9 +340,10 @@ def compose_readout_ubc(B: int, dbg: List[tuple], final_taus: List[float], PRIMS
     return final_unit_exprs[u_final]
 
 
-# -----------------------------
-# BNR metrics
-# -----------------------------
+# ------------------------------------------------------------
+# MLP interpretability: BNR + primitive matching on first layer
+# ------------------------------------------------------------
+
 def _round_tensor(x: torch.Tensor, decimals: int) -> torch.Tensor:
     if decimals <= 0:
         return torch.round(x)
@@ -287,6 +351,10 @@ def _round_tensor(x: torch.Tensor, decimals: int) -> torch.Tensor:
     return torch.round(x * scale) / scale
 
 def bnr_exact_fraction(layer_act: torch.Tensor, decimals: int = 6) -> float:
+    """
+    BNR_exact for one layer: fraction of units with <=2 distinct values
+    across the full truth table (after rounding).
+    """
     A = _round_tensor(layer_act.detach().cpu(), decimals=decimals)
     _, H = A.shape
     ok = 0
@@ -296,28 +364,33 @@ def bnr_exact_fraction(layer_act: torch.Tensor, decimals: int = 6) -> float:
     return ok / max(1, H)
 
 def bnr_eps_fraction(layer_act: torch.Tensor, eps: float = 1e-3) -> float:
+    """
+    BNR_eps proxy: values cluster tightly around 2 levels.
+    Works across PyTorch versions.
+    """
     A = layer_act.detach().cpu().float()
     _, H = A.shape
     ok = 0
     for j in range(H):
         v = A[:, j]
-        med = torch.median(v)
+        med = torch.median(v)          # <- robust scalar tensor
+
         lo = v[v <= med]
         hi = v[v >  med]
+
         if lo.numel() == 0 or hi.numel() == 0:
             ok += 1
             continue
-        c0 = torch.median(lo)
+
+        c0 = torch.median(lo)         # <- robust
         c1 = torch.median(hi)
+
         d = torch.minimum((v - c0).abs(), (v - c1).abs()).max().item()
         if d <= eps:
             ok += 1
     return ok / max(1, H)
 
 
-# -----------------------------
-# Primitive library
-# -----------------------------
 _PRIM16_NAMES = [
     "FALSE","AND","A&~B","A","~A&B","B","XOR","OR",
     "NOR","XNOR","~B","A|~B","~A","~A|B","NAND","TRUE"
@@ -339,15 +412,30 @@ def prim16_outputs(A: torch.Tensor, B: torch.Tensor) -> List[torch.Tensor]:
         NOR, XNOR, notB, A | notB, notA, notA | B, NAND, T
     ]
 
-def interpret_mlp_first_layer_primitives(X: torch.Tensor, act1: torch.Tensor) -> Dict[str, Any]:
-    Xb = (X.detach().cpu() >= 0.5)
+def interpret_mlp_first_layer_primitives(
+    X: torch.Tensor,          # (N,B) float
+    act1: torch.Tensor,       # (N,H) float (ReLU outputs of first hidden layer)
+) -> Dict[str, Any]:
+    """
+    Binarize each L1 unit at threshold u(0...0), then search best exact match among:
+      - literals a_i / ~a_i
+      - all 16 2-input gates over ordered pairs (a_i, a_j), i != j
+
+    Returns:
+      - primitive_hit_rate_L1: fraction of units with best_acc == 1.0
+      - mean_best_primitive_acc_L1: mean of best_acc over units
+      - gate_hist_exact: histogram of gate types among exact hits
+      - best_sample: small list of best matches for first few units
+    """
+    Xb = (X.detach().cpu() >= 0.5)  # (N,B) bool
     A1 = act1.detach().cpu().float()
-    _, B = Xb.shape
+    N, B = Xb.shape
     _, H = A1.shape
 
     zero_row = (Xb.sum(dim=1) == 0).nonzero(as_tuple=False)
     zero_idx = int(zero_row[0].item()) if zero_row.numel() > 0 else 0
 
+    # build literal templates
     literals = []
     lit_names = []
     for i in range(B):
@@ -357,24 +445,22 @@ def interpret_mlp_first_layer_primitives(X: torch.Tensor, act1: torch.Tensor) ->
     gate_hist_exact = Counter()
     best_accs = []
     exact_hits = 0
+    best_sample = []
 
     for j in range(H):
         u = A1[:, j]
         t = float(u[zero_idx].item())
-        yb = (u >= t)
+        yb = (u >= t)  # bool (N,)
 
-        best_acc = -1.0
-        best_kind = "lit"
-        best_name = ""
+        best = {"acc": -1.0, "kind": "", "name": "", "pair": None}
+
         # literals
         for tmpl, nm in zip(literals, lit_names):
             acc = (yb == tmpl).float().mean().item()
-            if acc > best_acc:
-                best_acc = acc
-                best_kind = "lit"
-                best_name = nm
+            if acc > best["acc"]:
+                best = {"acc": acc, "kind": "lit", "name": nm, "pair": None}
 
-        # gates
+        # gates over ordered pairs
         for i in range(B):
             Ai = Xb[:, i]
             for k in range(B):
@@ -384,37 +470,73 @@ def interpret_mlp_first_layer_primitives(X: torch.Tensor, act1: torch.Tensor) ->
                 outs = prim16_outputs(Ai, Bk)
                 for gi, gout in enumerate(outs):
                     acc = (yb == gout).float().mean().item()
-                    if acc > best_acc:
-                        best_acc = acc
-                        best_kind = "gate16"
-                        best_name = _PRIM16_NAMES[gi]
+                    if acc > best["acc"]:
+                        best = {"acc": acc, "kind": "gate16", "name": _PRIM16_NAMES[gi], "pair": (i, k)}
 
-        best_accs.append(best_acc)
-        if best_acc == 1.0:
+        best_accs.append(best["acc"])
+        if best["acc"] == 1.0:
             exact_hits += 1
-            if best_kind == "gate16":
-                gate_hist_exact[best_name] += 1
+            gate_hist_exact[best["name"]] += 1
+
+        if j < 12:
+            best_sample.append(best)
 
     return {
         "primitive_hit_rate_L1": float(exact_hits / max(1, H)),
         "mean_best_primitive_acc_L1": float(sum(best_accs) / max(1, len(best_accs))),
         "gate_hist_exact": dict(gate_hist_exact),
+        "best_sample": best_sample,
     }
 
 
-# -----------------------------
-# MLP: layerwise primitive recoverability + all-layer gate hist
-# -----------------------------
-def extract_boolean_expr_from_mlp(X: torch.Tensor, y_pred: torch.Tensor, acts: List[torch.Tensor]) -> Dict[str, Any]:
+# ------------------------------------------------------------
+# MLP: boolean circuit extraction from binarized activations (layer-by-layer)
+# ------------------------------------------------------------
+
+def _gate_expr_from_name(name: str, A_expr: str, B_expr: str) -> str:
+    if name == "FALSE": return "0"
+    if name == "TRUE":  return "1"
+    if name == "A":     return A_expr
+    if name == "B":     return B_expr
+    if name == "~A":    return _not_expr(A_expr)
+    if name == "~B":    return _not_expr(B_expr)
+    if name == "AND":   return f"({A_expr} & {B_expr})"
+    if name == "OR":    return f"({A_expr} | {B_expr})"
+    if name == "A&~B":  return f"({A_expr} & {_not_expr(B_expr)})"
+    if name == "~A&B":  return f"({_not_expr(A_expr)} & {B_expr})"
+    if name == "A|~B":  return f"({A_expr} | {_not_expr(B_expr)})"
+    if name == "~A|B":  return f"({_not_expr(A_expr)} | {B_expr})"
+    if name == "NAND":  return _not_expr(f"({A_expr} & {B_expr})")
+    if name == "NOR":   return _not_expr(f"({A_expr} | {B_expr})")
+    if name == "XOR":
+        return f"(({A_expr} & {_not_expr(B_expr)}) | ({_not_expr(A_expr)} & {B_expr}))"
+    if name == "XNOR":
+        return _not_expr(f"(({A_expr} & {_not_expr(B_expr)}) | ({_not_expr(A_expr)} & {B_expr}))")
+    if name == "~B":    return _not_expr(B_expr)
+    return f"({A_expr} | {B_expr})"
+
+def extract_boolean_expr_from_mlp(
+    X: torch.Tensor,
+    y_pred: torch.Tensor,
+    acts: List[torch.Tensor],
+) -> Dict[str, Any]:
+    """
+    Build a rough boolean-circuit explanation for MLP by:
+      - binarize each unit at threshold = its activation on x=0...0
+      - fit each unit's binarized outputs using literals or 16-gates over previous layer units
+      - fit final output similarly from last hidden layer.
+    """
     Xb = (X.detach().cpu() >= 0.5)
+    N, B = Xb.shape
+
     zero_row = (Xb.sum(dim=1) == 0).nonzero(as_tuple=False)
     zero_idx = int(zero_row[0].item()) if zero_row.numel() > 0 else 0
 
     prev_bool = Xb
-    prev_exprs = [f"a{i}" for i in range(Xb.shape[1])]
+    prev_exprs = [f"a{i}" for i in range(B)]
 
     layer_stats = []
-    gate_hist_exact_all = Counter()
+    layer1_expr_samples = []
 
     for li, A in enumerate(acts):
         A = A.detach().cpu().float()
@@ -422,36 +544,26 @@ def extract_boolean_expr_from_mlp(X: torch.Tensor, y_pred: torch.Tensor, acts: L
         thresh = A[zero_idx, :]
         cur_bool = (A >= thresh.unsqueeze(0))
 
+        cur_exprs = []
         exact_count = 0
         best_accs = []
 
         prev_literals = []
+        prev_lit_expr = []
         for k in range(prev_bool.shape[1]):
-            prev_literals.append(prev_bool[:, k])
-            prev_literals.append(~prev_bool[:, k])
+            prev_literals.append(prev_bool[:, k]); prev_lit_expr.append(prev_exprs[k])
+            prev_literals.append(~prev_bool[:, k]); prev_lit_expr.append(_not_expr(prev_exprs[k]))
 
         P = prev_bool.shape[1]
-        cur_exprs = []
-
         for j in range(H):
             yj = cur_bool[:, j]
+            best = {"acc": -1.0, "expr": ""}
 
-            best_acc = -1.0
-            best_is_gate16 = False
-            best_gate_name = None
-            best_expr = ""
+            for t, e in zip(prev_literals, prev_lit_expr):
+                acc = (yj == t).float().mean().item()
+                if acc > best["acc"]:
+                    best = {"acc": acc, "expr": e}
 
-            # literals / neg-literals of prev
-            for kk in range(P):
-                for t, e in [(prev_bool[:, kk], prev_exprs[kk]), (~prev_bool[:, kk], _not_expr(prev_exprs[kk]))]:
-                    acc = (yj == t).float().mean().item()
-                    if acc > best_acc:
-                        best_acc = acc
-                        best_is_gate16 = False
-                        best_gate_name = None
-                        best_expr = e
-
-            # gate16(prev_p, prev_q)
             for a_idx in range(P):
                 Acol = prev_bool[:, a_idx]; Aexpr = prev_exprs[a_idx]
                 for b_idx in range(P):
@@ -461,22 +573,14 @@ def extract_boolean_expr_from_mlp(X: torch.Tensor, y_pred: torch.Tensor, acts: L
                     outs = prim16_outputs(Acol, Bcol)
                     for gi, gout in enumerate(outs):
                         acc = (yj == gout).float().mean().item()
-                        if acc > best_acc:
+                        if acc > best["acc"]:
                             name = _PRIM16_NAMES[gi]
-                            best_acc = acc
-                            best_is_gate16 = True
-                            best_gate_name = name
-                            best_expr = _apply_prim_to_syms(name if name in {"A","B","~A","~B","AND","OR","A&~B","~A&B","A|~B","~A|B","NAND","NOR","XOR","XNOR","FALSE","TRUE"} else "OR", Aexpr, Bexpr)
-                            # Use the existing symbolic builder for robustness
-                            best_expr = best_expr
+                            best = {"acc": acc, "expr": _gate_expr_from_name(name, Aexpr, Bexpr)}
 
-            cur_exprs.append(best_expr)
-            best_accs.append(best_acc)
-
-            if best_acc == 1.0:
+            cur_exprs.append(best["expr"])
+            best_accs.append(best["acc"])
+            if best["acc"] == 1.0:
                 exact_count += 1
-                if best_is_gate16 and best_gate_name is not None:
-                    gate_hist_exact_all[best_gate_name] += 1
 
         layer_stats.append({
             "layer": li,
@@ -485,61 +589,48 @@ def extract_boolean_expr_from_mlp(X: torch.Tensor, y_pred: torch.Tensor, acts: L
             "mean_best_fit_acc": float(sum(best_accs) / max(1, len(best_accs))),
         })
 
+        if li == 0:
+            layer1_expr_samples = [normalize_expr(e) for e in cur_exprs[: min(20, len(cur_exprs))]]
+
         prev_bool = cur_bool
         prev_exprs = cur_exprs
 
-    # final output gate (path)
+    # final output fit
     yb = (y_pred.detach().cpu().view(-1) >= 0.5)
     P = prev_bool.shape[1]
-
-    best_out_acc = -1.0
-    best_out_is_gate16 = False
-    best_out_gate = None
+    best_out = {"acc": -1.0, "expr": ""}
 
     for k in range(P):
-        for t in [prev_bool[:, k], ~prev_bool[:, k]]:
+        for t, e in [(prev_bool[:, k], prev_exprs[k]), (~prev_bool[:, k], _not_expr(prev_exprs[k]))]:
             acc = (yb == t).float().mean().item()
-            if acc > best_out_acc:
-                best_out_acc = acc
-                best_out_is_gate16 = False
-                best_out_gate = None
+            if acc > best_out["acc"]:
+                best_out = {"acc": acc, "expr": e}
 
     for a_idx in range(P):
-        Acol = prev_bool[:, a_idx]
+        Acol = prev_bool[:, a_idx]; Aexpr = prev_exprs[a_idx]
         for b_idx in range(P):
             if b_idx == a_idx:
                 continue
-            Bcol = prev_bool[:, b_idx]
+            Bcol = prev_bool[:, b_idx]; Bexpr = prev_exprs[b_idx]
             outs = prim16_outputs(Acol, Bcol)
             for gi, gout in enumerate(outs):
                 acc = (yb == gout).float().mean().item()
-                if acc > best_out_acc:
-                    best_out_acc = acc
-                    best_out_is_gate16 = True
-                    best_out_gate = _PRIM16_NAMES[gi]
-
-    gate_hist_exact_path = Counter()
-    if best_out_acc == 1.0 and best_out_is_gate16 and best_out_gate is not None:
-        gate_hist_exact_path[best_out_gate] += 1
-
-    # build per-layer primitive vectors
-    prim_exact_per_layer = [float(ls["exact_fit_rate"]) for ls in layer_stats]
-    prim_best_acc_per_layer = [float(ls["mean_best_fit_acc"]) for ls in layer_stats]
+                if acc > best_out["acc"]:
+                    name = _PRIM16_NAMES[gi]
+                    best_out = {"acc": acc, "expr": _gate_expr_from_name(name, Aexpr, Bexpr)}
 
     return {
+        "mlp_expr": normalize_expr(best_out["expr"]),
+        "mlp_expr_fit_acc": float(best_out["acc"]),
         "layer_stats": layer_stats,
-        "prim_exact_per_layer": prim_exact_per_layer,
-        "prim_best_acc_per_layer": prim_best_acc_per_layer,
-        "prim_exact_avg": float(sum(prim_exact_per_layer) / max(1, len(prim_exact_per_layer))) if prim_exact_per_layer else 0.0,
-        "prim_best_acc_avg": float(sum(prim_best_acc_per_layer) / max(1, len(prim_best_acc_per_layer))) if prim_best_acc_per_layer else 0.0,
-        "gate_hist_exact_all": dict(gate_hist_exact_all),
-        "gate_hist_exact_path": dict(gate_hist_exact_path),
+        "layer1_expr_samples": layer1_expr_samples,
     }
 
 
-# -----------------------------
-# Train loops
-# -----------------------------
+# ------------------------------------------------------------
+# Training loops
+# ------------------------------------------------------------
+
 @dataclass
 class UBCOut:
     row_acc: float
@@ -549,7 +640,8 @@ class UBCOut:
     pred_expr: str
     gate_usage: Dict[str, Any]
 
-def train_ubc_instance(device: torch.device, cfg: Dict[str, Any], inst: Dict[str, Any], *, S_used: int, L_used: int) -> UBCOut:
+def train_ubc_instance(device: torch.device, cfg: Dict[str, Any], inst: Dict[str, Any],
+                       *, S_used: int, L_used: int) -> UBCOut:
     B = int(inst["B"])
     formula = str(inst["formula"])
     X, y_true = T.truth_table_from_formula(B, formula)
@@ -568,9 +660,11 @@ def train_ubc_instance(device: torch.device, cfg: Dict[str, Any], inst: Dict[str
     pair_cfg = dict(cfg.get("pair", {}) or {})
     pair_cfg = resolve_pair_cfg(pair_cfg, B=B, B_eff=B_eff, S=S_used, X=X, y_true=y_true)
 
-    model = DepthStack(B=B, L=L_used, S=S_used, tau=T0,
-                       pair=pair_cfg, gate_set=gate_set,
-                       use_lifting=use_lifting, lift_factor=lift_factor).to(device)
+    model = DepthStack(
+        B=B, L=L_used, S=S_used, tau=T0,
+        pair=pair_cfg, gate_set=gate_set,
+        use_lifting=use_lifting, lift_factor=lift_factor,
+    ).to(device)
 
     opt_name = str(cfg["optimizer"]).lower()
     opt = (optim.RMSprop(model.parameters(), lr=cfg["lr"], alpha=0.99, eps=1e-8)
@@ -601,11 +695,9 @@ def train_ubc_instance(device: torch.device, cfg: Dict[str, Any], inst: Dict[str
         )
         if hasattr(model, "set_layer_taus_and_bandwidths") and gate_set == "16":
             s_cfg = cfg.get("sigma16", {})
-            model.set_layer_taus_and_bandwidths(
-                taus,
-                s_start=float(s_cfg.get("s_start", 0.25)),
-                s_end=float(s_cfg.get("s_end", 0.10)),
-            )
+            s_start = float(s_cfg.get("s_start", 0.25))
+            s_end   = float(s_cfg.get("s_end", 0.10))
+            model.set_layer_taus_and_bandwidths(taus, s_start=s_start, s_end=s_end)
         else:
             model.set_layer_taus(taus)
 
@@ -636,14 +728,23 @@ def train_ubc_instance(device: torch.device, cfg: Dict[str, Any], inst: Dict[str
     y_pred, dbg, final_taus = last
     with torch.no_grad():
         row_acc, em = per_instance_metrics(y_true, y_pred)
+
         if gate_set == "16":
             from .boolean_prims16 import PRIMS16 as PRIMS
         else:
             from .boolean_prims import PRIMS as PRIMS
+
         pred_expr = normalize_expr(compose_readout_ubc(B, dbg, final_taus, PRIMS))
         gate_usage = extract_gate_usage_from_dbg(dbg, final_taus, PRIMS)
 
-    return UBCOut(row_acc=row_acc, em=em, dbg=dbg, taus=final_taus, pred_expr=pred_expr, gate_usage=gate_usage)
+    return UBCOut(
+        row_acc=row_acc,
+        em=em,
+        dbg=dbg,
+        taus=final_taus,
+        pred_expr=pred_expr,
+        gate_usage=gate_usage,
+    )
 
 
 @dataclass
@@ -652,21 +753,17 @@ class MLPOut:
     em: int
     n_params: int
 
+    # interpretability
     bnr_exact_per_layer: List[float]
     bnr_eps_per_layer: List[float]
-
     primitive_hit_rate_L1: float
     mean_best_primitive_acc_L1: float
     gate_hist_exact_L1: Dict[str, int]
 
-    prim_exact_per_layer: List[float]
-    prim_best_acc_per_layer: List[float]
-    prim_exact_avg: float
-    prim_best_acc_avg: float
-
-    gate_hist_exact_all: Dict[str, int]
-    gate_hist_exact_path: Dict[str, int]
-
+    # extracted expr
+    mlp_expr: str
+    mlp_expr_fit_acc: float
+    layer_stats: List[Dict[str, Any]]
 
 def train_mlp_instance(device: torch.device, cfg: Dict[str, Any], inst: Dict[str, Any],
                        *, S_used: int, L_used: int,
@@ -688,6 +785,7 @@ def train_mlp_instance(device: torch.device, cfg: Dict[str, Any], inst: Dict[str
         mlp, n_params = build_mlp_param_matched(B=B, depth=L_used, target_params=ubc_total_params)
     else:
         raise ValueError("mlp_match must be one of neuron|param_soft|param_total")
+
     mlp = mlp.to(device)
 
     opt_name = str(cfg["optimizer"]).lower()
@@ -696,6 +794,7 @@ def train_mlp_instance(device: torch.device, cfg: Dict[str, Any], inst: Dict[str
            optim.Adam(mlp.parameters(), lr=cfg["lr"]))
 
     steps = int(cfg["steps"])
+
     es_cfg = cfg.get("early_stop", {})
     use_es = bool(es_cfg.get("use", False))
     min_steps = int(es_cfg.get("min_steps", 0))
@@ -724,36 +823,42 @@ def train_mlp_instance(device: torch.device, cfg: Dict[str, Any], inst: Dict[str
         y_pred, acts = mlp(X, return_acts=True)
         row_acc, em = per_instance_metrics(y_true, y_pred)
 
+        # BNR metrics
         bnr_exact = [bnr_exact_fraction(a, decimals=6) for a in acts]
         bnr_eps   = [bnr_eps_fraction(a, eps=1e-3) for a in acts]
 
+        # primitive interpretability on FIRST layer only (input bits -> hidden)
         primL1 = interpret_mlp_first_layer_primitives(X, acts[0]) if len(acts) > 0 else {
             "primitive_hit_rate_L1": 0.0,
             "mean_best_primitive_acc_L1": 0.0,
             "gate_hist_exact": {},
+            "best_sample": [],
         }
 
+        # extracted MLP expr (layer-by-layer greedy)
         expl = extract_boolean_expr_from_mlp(X, y_pred, acts)
 
     return MLPOut(
-        row_acc=row_acc, em=em, n_params=n_params,
+        row_acc=row_acc,
+        em=em,
+        n_params=n_params,
+
         bnr_exact_per_layer=bnr_exact,
         bnr_eps_per_layer=bnr_eps,
         primitive_hit_rate_L1=float(primL1["primitive_hit_rate_L1"]),
         mean_best_primitive_acc_L1=float(primL1["mean_best_primitive_acc_L1"]),
         gate_hist_exact_L1=dict(primL1.get("gate_hist_exact", {})),
-        prim_exact_per_layer=list(expl.get("prim_exact_per_layer", [])),
-        prim_best_acc_per_layer=list(expl.get("prim_best_acc_per_layer", [])),
-        prim_exact_avg=float(expl.get("prim_exact_avg", 0.0)),
-        prim_best_acc_avg=float(expl.get("prim_best_acc_avg", 0.0)),
-        gate_hist_exact_all=dict(expl.get("gate_hist_exact_all", {})),
-        gate_hist_exact_path=dict(expl.get("gate_hist_exact_path", {})),
+
+        mlp_expr=expl["mlp_expr"],
+        mlp_expr_fit_acc=expl["mlp_expr_fit_acc"],
+        layer_stats=expl["layer_stats"],
     )
 
 
-# -----------------------------
+# ------------------------------------------------------------
 # Main runner
-# -----------------------------
+# ------------------------------------------------------------
+
 def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
     device = _device(cfg)
     seed_all(cfg["seed"])
@@ -763,6 +868,7 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
     expr_csv = out_dir / "expr_table.csv"
 
     insts = T.load_instances_jsonl(cfg["dataset"])
+
     if results_jsonl.exists():
         results_jsonl.unlink()
 
@@ -799,25 +905,26 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
             ubc_soft_params=ubc_soft, ubc_total_params=ubc_total,
         )
 
+        # lengths
         lab_char, lab_tok = expr_complexity(label_expr)
         ubc_char, ubc_tok = expr_complexity(ubc.pred_expr)
-        mlp_char, mlp_tok = expr_complexity("")  # no expr string here
-        shortest = min({"label": (lab_tok, lab_char), "ubc": (ubc_tok, ubc_char), "mlp": (mlp_tok, mlp_char)}, key=lambda k: {"label": (lab_tok, lab_char), "ubc": (ubc_tok, ubc_char), "mlp": (mlp_tok, mlp_char)}[k])
+        mlp_char, mlp_tok = expr_complexity(mlp.mlp_expr)
 
-        bnr_exact_L1 = mlp.bnr_exact_per_layer[0] if mlp.bnr_exact_per_layer else 0.0
-        bnr_eps_L1   = mlp.bnr_eps_per_layer[0] if mlp.bnr_eps_per_layer else 0.0
-        bnr_exact_avg = float(sum(mlp.bnr_exact_per_layer) / max(1, len(mlp.bnr_exact_per_layer))) if mlp.bnr_exact_per_layer else 0.0
-        bnr_eps_avg   = float(sum(mlp.bnr_eps_per_layer) / max(1, len(mlp.bnr_eps_per_layer))) if mlp.bnr_eps_per_layer else 0.0
-
-        prim_exact_L1 = mlp.prim_exact_per_layer[0] if mlp.prim_exact_per_layer else 0.0
-        prim_best_L1  = mlp.prim_best_acc_per_layer[0] if mlp.prim_best_acc_per_layer else 0.0
+        # shortest (token then char)
+        ranks = {
+            "label": (lab_tok, lab_char),
+            "ubc":   (ubc_tok, ubc_char),
+            "mlp":   (mlp_tok, mlp_char),
+        }
+        shortest = min(ranks, key=ranks.get)
 
         row = {
             "idx": idx,
             "B": B,
-            "S_used": S_used,
-            "L_used": L_used,
+            "S_base": S_base, "S_used": S_used,
+            "L_base": L_base, "L_used": L_used,
             "label_expr": label_expr,
+
             "ubc": {
                 "em": ubc.em,
                 "row_acc": ubc.row_acc,
@@ -831,17 +938,16 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
                 "em": mlp.em,
                 "row_acc": mlp.row_acc,
                 "n_params": mlp.n_params,
+
                 "bnr_exact_per_layer": mlp.bnr_exact_per_layer,
                 "bnr_eps_per_layer": mlp.bnr_eps_per_layer,
                 "primitive_hit_rate_L1": mlp.primitive_hit_rate_L1,
                 "mean_best_primitive_acc_L1": mlp.mean_best_primitive_acc_L1,
                 "gate_hist_exact_L1": mlp.gate_hist_exact_L1,
-                "prim_exact_per_layer": mlp.prim_exact_per_layer,
-                "prim_best_acc_per_layer": mlp.prim_best_acc_per_layer,
-                "prim_exact_avg": mlp.prim_exact_avg,
-                "prim_best_acc_avg": mlp.prim_best_acc_avg,
-                "gate_hist_exact_all": mlp.gate_hist_exact_all,
-                "gate_hist_exact_path": mlp.gate_hist_exact_path,
+
+                "mlp_expr": mlp.mlp_expr,
+                "mlp_expr_fit_acc": mlp.mlp_expr_fit_acc,
+                "layer_stats": mlp.layer_stats,
             },
             "expr_lengths": {
                 "label": {"char": lab_char, "tok": lab_tok},
@@ -854,54 +960,119 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
         with results_jsonl.open("a") as f:
             f.write(json.dumps(row) + "\n")
 
-        print(
-            f"[{idx+1}/{len(insts)}] B={B} S={S_used} L={L_used} | "
-            f"UBC EM={ubc.em} acc={ubc.row_acc:.3f} | "
-            f"MLP({args.mlp_match}) EM={mlp.em} acc={mlp.row_acc:.3f} | "
-            f"BNR(L1)={bnr_exact_L1:.3f}/{bnr_eps_L1:.3f} BNR(avg)={bnr_exact_avg:.3f}/{bnr_eps_avg:.3f} | "
-            f"prim(L1)={prim_exact_L1:.3f}/{prim_best_L1:.3f} prim(avg)={mlp.prim_exact_avg:.3f}/{mlp.prim_best_acc_avg:.3f}"
-        )
-        print(f"   bnr_exact_per_layer: {[round(x,3) for x in mlp.bnr_exact_per_layer]}")
-        print(f"   bnr_eps_per_layer  : {[round(x,3) for x in mlp.bnr_eps_per_layer]}")
-        print(f"   prim_exact_per_layer: {[round(x,3) for x in mlp.prim_exact_per_layer]}")
-        print(f"   prim_best_acc_per_layer: {[round(x,3) for x in mlp.prim_best_acc_per_layer]}")
+        bnr_exact_L1 = mlp.bnr_exact_per_layer[0] if mlp.bnr_exact_per_layer else 0.0
+        bnr_eps_L1   = mlp.bnr_eps_per_layer[0] if mlp.bnr_eps_per_layer else 0.0
+
+        expr_rows.append({
+            "idx": idx,
+            "B": B,
+            "S_used": S_used,
+            "L_used": L_used,
+
+            "ubc_em": ubc.em,
+            "mlp_em": mlp.em,
+
+            "bnr_exact_L1": bnr_exact_L1,
+            "bnr_eps_L1": bnr_eps_L1,
+            "prim_hit_L1": mlp.primitive_hit_rate_L1,
+            "prim_best_acc_L1": mlp.mean_best_primitive_acc_L1,
+
+            "mlp_expr_fit_acc": mlp.mlp_expr_fit_acc,
+
+            "label_tok": lab_tok, "label_char": lab_char,
+            "ubc_tok": ubc_tok, "ubc_char": ubc_char,
+            "mlp_tok": mlp_tok, "mlp_char": mlp_char,
+            "shortest": shortest,
+
+            "label_expr": label_expr,
+            "ubc_expr": ubc.pred_expr,
+            "mlp_expr": mlp.mlp_expr,
+        })
 
         # aggregates
         agg["ubc_em"].append(float(ubc.em))
         agg["mlp_em"].append(float(mlp.em))
+        agg["ubc_row_acc"].append(float(ubc.row_acc))
+        agg["mlp_row_acc"].append(float(mlp.row_acc))
 
+        agg["mlp_params"].append(float(mlp.n_params))
+        agg["ubc_soft_params"].append(float(ubc_soft))
+        agg["ubc_total_params"].append(float(ubc_total))
+
+        agg["mlp_expr_fit_acc"].append(float(mlp.mlp_expr_fit_acc))
         agg["bnr_exact_L1"].append(float(bnr_exact_L1))
         agg["bnr_eps_L1"].append(float(bnr_eps_L1))
-        agg["bnr_exact_avg"].append(float(bnr_exact_avg))
-        agg["bnr_eps_avg"].append(float(bnr_eps_avg))
+        agg["prim_hit_L1"].append(float(mlp.primitive_hit_rate_L1))
+        agg["prim_best_acc_L1"].append(float(mlp.mean_best_primitive_acc_L1))
 
-        agg["prim_exact_L1"].append(float(prim_exact_L1))
-        agg["prim_best_L1"].append(float(prim_best_L1))
-        agg["prim_exact_avg"].append(float(mlp.prim_exact_avg))
-        agg["prim_best_avg"].append(float(mlp.prim_best_acc_avg))
+        print(
+            f"[{idx+1}/{len(insts)}] B={B} S={S_used} L={L_used} | "
+            f"UBC EM={ubc.em} acc={ubc.row_acc:.3f} | "
+            f"MLP({args.mlp_match}) EM={mlp.em} acc={mlp.row_acc:.3f} | "
+            f"BNR(L1)={bnr_exact_L1:.3f}/{bnr_eps_L1:.3f} primHit(L1)={mlp.primitive_hit_rate_L1:.3f} | "
+            f"shortest={shortest}"
+        )
+        print(f"   label: {label_expr}")
+        print(f"   ubc  : {ubc.pred_expr}")
+        print(f"   mlp  : {mlp.mlp_expr}  [expr_fit_acc={mlp.mlp_expr_fit_acc:.3f}]")
 
-    # minimal summary
+    # write expr_table.csv
+    def esc(s: str) -> str:
+        s = (s or "").replace('"', '""')
+        return f"\"{s}\""
+
+    with expr_csv.open("w") as f:
+        cols = [
+            "idx","B","S_used","L_used",
+            "ubc_em","mlp_em",
+            "bnr_exact_L1","bnr_eps_L1","prim_hit_L1","prim_best_acc_L1",
+            "mlp_expr_fit_acc",
+            "label_tok","label_char","ubc_tok","ubc_char","mlp_tok","mlp_char","shortest",
+            "label_expr","ubc_expr","mlp_expr"
+        ]
+        f.write(",".join(cols) + "\n")
+        for r in expr_rows:
+            f.write(",".join([
+                str(r["idx"]), str(r["B"]), str(r["S_used"]), str(r["L_used"]),
+                str(r["ubc_em"]), str(r["mlp_em"]),
+                f"{r['bnr_exact_L1']:.6f}", f"{r['bnr_eps_L1']:.6f}",
+                f"{r['prim_hit_L1']:.6f}", f"{r['prim_best_acc_L1']:.6f}",
+                f"{r['mlp_expr_fit_acc']:.6f}",
+                str(r["label_tok"]), str(r["label_char"]),
+                str(r["ubc_tok"]), str(r["ubc_char"]),
+                str(r["mlp_tok"]), str(r["mlp_char"]),
+                r["shortest"],
+                esc(r["label_expr"]), esc(r["ubc_expr"]), esc(r["mlp_expr"]),
+            ]) + "\n")
+
     n = max(1, len(insts))
     summary = {
         "config": cfg,
         "mlp_match": args.mlp_match,
+        "scale": {
+            "S_op": args.S_op, "S_k": args.S_k, "S_min": args.S_min, "S_max": args.S_max,
+            "L_op": args.L_op, "L_k": args.L_k, "L_min": args.L_min, "L_max": args.L_max,
+        },
         "means": {
             "ubc_em_rate": float(sum(agg["ubc_em"]) / n),
             "mlp_em_rate": float(sum(agg["mlp_em"]) / n),
+            "ubc_row_acc": float(sum(agg["ubc_row_acc"]) / n),
+            "mlp_row_acc": float(sum(agg["mlp_row_acc"]) / n),
+            "mlp_params": float(sum(agg["mlp_params"]) / n),
+            "ubc_soft_params": float(sum(agg["ubc_soft_params"]) / n),
+            "ubc_total_params": float(sum(agg["ubc_total_params"]) / n),
+            "mlp_expr_fit_acc": float(sum(agg["mlp_expr_fit_acc"]) / n),
             "bnr_exact_L1": float(sum(agg["bnr_exact_L1"]) / n),
             "bnr_eps_L1": float(sum(agg["bnr_eps_L1"]) / n),
-            "bnr_exact_avg": float(sum(agg["bnr_exact_avg"]) / n),
-            "bnr_eps_avg": float(sum(agg["bnr_eps_avg"]) / n),
-            "prim_exact_L1": float(sum(agg["prim_exact_L1"]) / n),
-            "prim_best_L1": float(sum(agg["prim_best_L1"]) / n),
-            "prim_exact_avg": float(sum(agg["prim_exact_avg"]) / n),
-            "prim_best_avg": float(sum(agg["prim_best_avg"]) / n),
+            "prim_hit_L1": float(sum(agg["prim_hit_L1"]) / n),
+            "prim_best_acc_L1": float(sum(agg["prim_best_acc_L1"]) / n),
         },
         "n_instances": len(insts),
         "results_jsonl": str(results_jsonl),
+        "expr_table_csv": str(expr_csv),
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
-    print(f"[ok] wrote summary.json + results.jsonl in {out_dir}")
+    print(f"[ok] wrote summary.json + results.jsonl + expr_table.csv in {out_dir}")
     return summary
 
 

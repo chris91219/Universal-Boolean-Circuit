@@ -5,7 +5,6 @@ Analyze joint_bnr runs (UBC + MLP) across seeds and match modes.
 Expected per run_dir:
   - summary.json
   - results.jsonl
-  - expr_table.csv (optional; results.jsonl is the source of truth)
 
 Outputs:
   - meta_runs.csv
@@ -15,15 +14,14 @@ Outputs:
   - gate_stats_long.csv
   - gate_stats_by_mode.csv
 
-Adds:
-  (1) Across-layers primitive scores from m["layer_stats"]:
-      - mlp_prim_exact_avg_layers  (mean over layers of exact_fit_rate)
-      - mlp_prim_best_acc_avg_layers (mean over layers of mean_best_fit_acc)
-
-  (2) Gate stats:
-      - UBC path gates (path_counts)
-      - UBC all-unit gates (all_unit_counts)
-      - MLP exact-hit L1 gates (gate_hist_exact_L1)
+Updated to match new joint script outputs:
+MLP fields used:
+  - bnr_exact_per_layer, bnr_eps_per_layer
+  - primitive_hit_rate_L1, mean_best_primitive_acc_L1 (input-bit primitive probe)
+  - prim_exact_per_layer, prim_best_acc_per_layer, prim_exact_avg, prim_best_acc_avg (layerwise primitive probe)
+  - gate_hist_exact_L1, gate_hist_exact_all, gate_hist_exact_path
+UBC fields used:
+  - gate_usage.path_counts, gate_usage.all_unit_counts
 """
 
 from __future__ import annotations
@@ -31,7 +29,7 @@ import argparse
 import json
 import math
 from pathlib import Path
-from collections import Counter, defaultdict
+from collections import Counter
 
 import pandas as pd
 
@@ -79,18 +77,30 @@ def parse_seed_from_path(run_dir: Path) -> int | None:
     return None
 
 
+def _counter_from_dict(d: dict) -> Counter:
+    c = Counter()
+    for k, v in (d or {}).items():
+        try:
+            c[str(k)] += int(v)
+        except Exception:
+            pass
+    return c
+
+
 def _add_gate_stats_rows(rows: list, *, run_dir: str, match_mode: str, seed: int | None,
                          source: str, gate_counter: Counter):
     total = sum(gate_counter.values())
+    if total <= 0:
+        return
     for gate, cnt in gate_counter.items():
         rows.append({
             "run_dir": run_dir,
             "match_mode": match_mode,
             "seed": seed,
-            "source": source,            # ubc_path | ubc_all | mlp_L1_exact
+            "source": source,            # ubc_path | ubc_all | mlp_L1 | mlp_all | mlp_path
             "gate": str(gate),
             "count": int(cnt),
-            "frac": float(cnt) / float(total) if total > 0 else 0.0,
+            "frac": float(cnt) / float(total),
             "total": int(total),
         })
 
@@ -111,44 +121,49 @@ def main():
     rows_gate_stats_long = []
 
     for run_dir in find_run_dirs(root):
-        summary_path = run_dir / "summary.json"
-        results_path = run_dir / "results.jsonl"
-
-        summ = json.loads(summary_path.read_text())
+        summ = json.loads((run_dir / "summary.json").read_text())
         match_mode = summ.get("mlp_match", "unknown")
         seed = parse_seed_from_path(run_dir)
 
         ubc_em = []
         mlp_em = []
-        ubc_expr_eq = []
 
+        # BNR (L1 + avg)
         bnr_exact_L1 = []
-        bnr_exact_avg = []
         bnr_eps_L1 = []
+        bnr_exact_avg = []
+        bnr_eps_avg = []
 
-        prim_hit_L1 = []
-        prim_best_acc_L1 = []
+        # Input-bit primitive probe (L1 only)
+        prim_hit_input_L1 = []
+        prim_best_input_L1 = []
 
-        # NEW: across-layer primitive scores (from layer_stats)
-        prim_exact_avg_layers = []
-        prim_best_acc_avg_layers = []
+        # Layerwise primitive probe (L1 + avg)
+        prim_exact_L1 = []
+        prim_best_L1 = []
+        prim_exact_avg = []
+        prim_best_avg = []
 
-        # overlaps
-        gate_overlap_path = []
-        gate_overlap_all = []
+        # overlaps (various)
+        overlap_path_vs_mlpAll = []
+        overlap_all_vs_mlpAll = []
+        overlap_path_vs_mlpPath = []
+        overlap_all_vs_mlpPath = []
 
-        # expr length stats
+        # expr length
         shortest_counts = Counter()
         label_tok = []
         ubc_tok = []
         mlp_tok = []
 
-        # gate hist totals across instances (for per-run gate-stats)
+        # gate stats totals across instances
         ubc_path_tot = Counter()
         ubc_all_tot = Counter()
-        mlp_L1_exact_tot = Counter()
+        mlp_L1_tot = Counter()
+        mlp_all_tot = Counter()
+        mlp_path_tot = Counter()
 
-        with results_path.open("r") as f:
+        with (run_dir / "results.jsonl").open("r") as f:
             for line in f:
                 r = json.loads(line)
                 u = r.get("ubc", {}) or {}
@@ -157,53 +172,57 @@ def main():
                 ubc_em.append(float(u.get("em", 0)))
                 mlp_em.append(float(m.get("em", 0)))
 
-                ubc_expr_eq.append(1.0 if (u.get("pred_expr", "") == r.get("label_expr", "")) else 0.0)
-
-                # BNR
-                bnr_list = m.get("bnr_exact_per_layer", []) or []
-                bnr_exact_L1.append(float(bnr_list[0]) if bnr_list else 0.0)
-                bnr_exact_avg.append(float(sum(bnr_list) / max(1, len(bnr_list))) if bnr_list else 0.0)
-
-                eps_list = m.get("bnr_eps_per_layer", []) or []
-                bnr_eps_L1.append(float(eps_list[0]) if eps_list else 0.0)
-
-                prim_hit_L1.append(float(m.get("primitive_hit_rate_L1", 0.0)))
-                prim_best_acc_L1.append(float(m.get("mean_best_primitive_acc_L1", 0.0)))
-
-                # NEW: across-layers primitive scores
-                layer_stats = m.get("layer_stats", []) or []
-                if layer_stats:
-                    exact_rates = [float(ls.get("exact_fit_rate", 0.0)) for ls in layer_stats]
-                    best_accs = [float(ls.get("mean_best_fit_acc", 0.0)) for ls in layer_stats]
-                    prim_exact_avg_layers.append(sum(exact_rates) / max(1, len(exact_rates)))
-                    prim_best_acc_avg_layers.append(sum(best_accs) / max(1, len(best_accs)))
+                # ---- BNR ----
+                bnr_e = m.get("bnr_exact_per_layer", []) or []
+                bnr_p = m.get("bnr_eps_per_layer", []) or []
+                if bnr_e:
+                    bnr_exact_L1.append(float(bnr_e[0]))
+                    bnr_exact_avg.append(float(sum(bnr_e) / max(1, len(bnr_e))))
                 else:
-                    prim_exact_avg_layers.append(0.0)
-                    prim_best_acc_avg_layers.append(0.0)
+                    bnr_exact_L1.append(0.0); bnr_exact_avg.append(0.0)
+                if bnr_p:
+                    bnr_eps_L1.append(float(bnr_p[0]))
+                    bnr_eps_avg.append(float(sum(bnr_p) / max(1, len(bnr_p))))
+                else:
+                    bnr_eps_L1.append(0.0); bnr_eps_avg.append(0.0)
 
-                # gate usage
+                # ---- input-bit primitive probe (your original L1 search on inputs) ----
+                prim_hit_input_L1.append(float(m.get("primitive_hit_rate_L1", 0.0)))
+                prim_best_input_L1.append(float(m.get("mean_best_primitive_acc_L1", 0.0)))
+
+                # ---- layerwise primitive probe (from new fields) ----
+                pe = m.get("prim_exact_per_layer", []) or []
+                pb = m.get("prim_best_acc_per_layer", []) or []
+                prim_exact_L1.append(float(pe[0]) if pe else 0.0)
+                prim_best_L1.append(float(pb[0]) if pb else 0.0)
+                prim_exact_avg.append(float(m.get("prim_exact_avg", 0.0)))
+                prim_best_avg.append(float(m.get("prim_best_acc_avg", 0.0)))
+
+                # ---- gate usage ----
                 gu = u.get("gate_usage", {}) or {}
                 ubc_path = gu.get("path_counts", {}) or {}
-                ubc_all = gu.get("all_unit_counts", {}) or {}
+                ubc_all  = gu.get("all_unit_counts", {}) or {}
 
-                mlp_hist = m.get("gate_hist_exact_L1", {}) or {}
+                mlp_L1   = m.get("gate_hist_exact_L1", {}) or {}
+                mlp_all  = m.get("gate_hist_exact_all", {}) or {}
+                mlp_path = m.get("gate_hist_exact_path", {}) or {}
 
-                # per-instance overlaps
-                gate_overlap_path.append(multiset_jaccard(ubc_path, mlp_hist))
-                gate_overlap_all.append(multiset_jaccard(ubc_all, mlp_hist))
+                overlap_path_vs_mlpAll.append(multiset_jaccard(ubc_path, mlp_all))
+                overlap_all_vs_mlpAll.append(multiset_jaccard(ubc_all, mlp_all))
+                overlap_path_vs_mlpPath.append(multiset_jaccard(ubc_path, mlp_path))
+                overlap_all_vs_mlpPath.append(multiset_jaccard(ubc_all, mlp_path))
 
-                # accumulate totals for gate stats
-                ubc_path_tot.update({k: int(v) for k, v in ubc_path.items()})
-                ubc_all_tot.update({k: int(v) for k, v in ubc_all.items()})
-                mlp_L1_exact_tot.update({k: int(v) for k, v in mlp_hist.items()})
+                ubc_path_tot.update(_counter_from_dict(ubc_path))
+                ubc_all_tot.update(_counter_from_dict(ubc_all))
+                mlp_L1_tot.update(_counter_from_dict(mlp_L1))
+                mlp_all_tot.update(_counter_from_dict(mlp_all))
+                mlp_path_tot.update(_counter_from_dict(mlp_path))
 
-                # shortest
+                # ---- expression shortest + token lengths ----
                 el = r.get("expr_lengths", {}) or {}
                 sh = el.get("shortest", None)
                 if sh in {"label", "ubc", "mlp"}:
                     shortest_counts[sh] += 1
-
-                # token lengths
                 try:
                     label_tok.append(int(el.get("label", {}).get("tok", 0)))
                     ubc_tok.append(int(el.get("ubc", {}).get("tok", 0)))
@@ -213,7 +232,7 @@ def main():
 
         n_inst = len(ubc_em)
 
-        run_row = {
+        rows_runs.append({
             "run_dir": str(run_dir),
             "match_mode": match_mode,
             "seed": seed,
@@ -221,43 +240,48 @@ def main():
 
             "ubc_em_rate": safe_mean(ubc_em),
             "mlp_em_rate": safe_mean(mlp_em),
-            "ubc_expr_eq_rate": safe_mean(ubc_expr_eq),
 
+            # BNR
             "mlp_bnr_exact_L1": safe_mean(bnr_exact_L1),
-            "mlp_bnr_exact_avg": safe_mean(bnr_exact_avg),
             "mlp_bnr_eps_L1": safe_mean(bnr_eps_L1),
+            "mlp_bnr_exact_avg": safe_mean(bnr_exact_avg),
+            "mlp_bnr_eps_avg": safe_mean(bnr_eps_avg),
 
-            "mlp_prim_hit_L1": safe_mean(prim_hit_L1),
-            "mlp_prim_best_acc_L1": safe_mean(prim_best_acc_L1),
+            # input-bit primitive probe (L1 only)
+            "mlp_prim_hit_input_L1": safe_mean(prim_hit_input_L1),
+            "mlp_prim_best_input_L1": safe_mean(prim_best_input_L1),
 
-            # NEW across layers
-            "mlp_prim_exact_avg_layers": safe_mean(prim_exact_avg_layers),
-            "mlp_prim_best_acc_avg_layers": safe_mean(prim_best_acc_avg_layers),
+            # layerwise primitive probe
+            "mlp_prim_exact_L1": safe_mean(prim_exact_L1),
+            "mlp_prim_best_L1": safe_mean(prim_best_L1),
+            "mlp_prim_exact_avg": safe_mean(prim_exact_avg),
+            "mlp_prim_best_avg": safe_mean(prim_best_avg),
 
             # overlaps
-            "gate_overlap_path_vs_mlpL1": safe_mean(gate_overlap_path),
-            "gate_overlap_all_vs_mlpL1": safe_mean(gate_overlap_all),
+            "overlap_path_vs_mlpAll": safe_mean(overlap_path_vs_mlpAll),
+            "overlap_all_vs_mlpAll": safe_mean(overlap_all_vs_mlpAll),
+            "overlap_path_vs_mlpPath": safe_mean(overlap_path_vs_mlpPath),
+            "overlap_all_vs_mlpPath": safe_mean(overlap_all_vs_mlpPath),
 
+            # params
             "avg_mlp_params": float(summ.get("means", {}).get("mlp_params", float("nan"))),
             "avg_ubc_soft_params": float(summ.get("means", {}).get("ubc_soft_params", float("nan"))),
             "avg_ubc_total_params": float(summ.get("means", {}).get("ubc_total_params", float("nan"))),
 
+            # expr lengths
             "mean_label_tok": safe_mean(label_tok),
             "mean_ubc_tok": safe_mean(ubc_tok),
             "mean_mlp_tok": safe_mean(mlp_tok),
-        }
-        rows_runs.append(run_row)
+        })
 
         rows_overlap.append({
             "run_dir": str(run_dir),
             "match_mode": match_mode,
             "seed": seed,
-            "gate_overlap_path_vs_mlpL1": safe_mean(gate_overlap_path),
-            "gate_overlap_all_vs_mlpL1": safe_mean(gate_overlap_all),
-            "mlp_prim_hit_L1": safe_mean(prim_hit_L1),
-            "mlp_bnr_exact_L1": safe_mean(bnr_exact_L1),
-            "mlp_bnr_eps_L1": safe_mean(bnr_eps_L1),
-            "ubc_expr_eq_rate": safe_mean(ubc_expr_eq),
+            "overlap_path_vs_mlpAll": safe_mean(overlap_path_vs_mlpAll),
+            "overlap_all_vs_mlpAll": safe_mean(overlap_all_vs_mlpAll),
+            "overlap_path_vs_mlpPath": safe_mean(overlap_path_vs_mlpPath),
+            "overlap_all_vs_mlpPath": safe_mean(overlap_all_vs_mlpPath),
         })
 
         denom = max(1, n_inst)
@@ -271,86 +295,64 @@ def main():
             "shortest_mlp_rate": shortest_counts["mlp"] / denom,
         })
 
-        # gate stats rows (per run)
-        _add_gate_stats_rows(
-            rows_gate_stats_long,
-            run_dir=str(run_dir), match_mode=match_mode, seed=seed,
-            source="ubc_path", gate_counter=ubc_path_tot
-        )
-        _add_gate_stats_rows(
-            rows_gate_stats_long,
-            run_dir=str(run_dir), match_mode=match_mode, seed=seed,
-            source="ubc_all", gate_counter=ubc_all_tot
-        )
-        _add_gate_stats_rows(
-            rows_gate_stats_long,
-            run_dir=str(run_dir), match_mode=match_mode, seed=seed,
-            source="mlp_L1_exact", gate_counter=mlp_L1_exact_tot
-        )
+        # gate stats per run
+        _add_gate_stats_rows(rows_gate_stats_long, run_dir=str(run_dir), match_mode=match_mode, seed=seed,
+                             source="ubc_path", gate_counter=ubc_path_tot)
+        _add_gate_stats_rows(rows_gate_stats_long, run_dir=str(run_dir), match_mode=match_mode, seed=seed,
+                             source="ubc_all", gate_counter=ubc_all_tot)
+        _add_gate_stats_rows(rows_gate_stats_long, run_dir=str(run_dir), match_mode=match_mode, seed=seed,
+                             source="mlp_L1", gate_counter=mlp_L1_tot)
+        _add_gate_stats_rows(rows_gate_stats_long, run_dir=str(run_dir), match_mode=match_mode, seed=seed,
+                             source="mlp_all", gate_counter=mlp_all_tot)
+        _add_gate_stats_rows(rows_gate_stats_long, run_dir=str(run_dir), match_mode=match_mode, seed=seed,
+                             source="mlp_path", gate_counter=mlp_path_tot)
 
     df = pd.DataFrame(rows_runs)
     if df.empty:
-        print("[error] No runs found. Expected folders containing summary.json + results.jsonl.")
+        print("[error] No runs found.")
         return
 
     df.to_csv(out / "meta_runs.csv", index=False)
     pd.DataFrame(rows_overlap).to_csv(out / "gate_overlap.csv", index=False)
     pd.DataFrame(rows_shortest).to_csv(out / "expr_shortest.csv", index=False)
 
-    # Group by match mode
+    # group summary
     g = df.groupby("match_mode").agg(
         n_runs=("run_dir", "count"),
-
         ubc_em_mean=("ubc_em_rate", "mean"),
         ubc_em_std=("ubc_em_rate", "std"),
-
         mlp_em_mean=("mlp_em_rate", "mean"),
         mlp_em_std=("mlp_em_rate", "std"),
 
         mlp_bnr_exact_L1_mean=("mlp_bnr_exact_L1", "mean"),
-        mlp_bnr_exact_L1_std=("mlp_bnr_exact_L1", "std"),
-
-        mlp_bnr_exact_avg_mean=("mlp_bnr_exact_avg", "mean"),
-        mlp_bnr_exact_avg_std=("mlp_bnr_exact_avg", "std"),
-
         mlp_bnr_eps_L1_mean=("mlp_bnr_eps_L1", "mean"),
-        mlp_bnr_eps_L1_std=("mlp_bnr_eps_L1", "std"),
+        mlp_bnr_exact_avg_mean=("mlp_bnr_exact_avg", "mean"),
+        mlp_bnr_eps_avg_mean=("mlp_bnr_eps_avg", "mean"),
 
-        mlp_prim_hit_L1_mean=("mlp_prim_hit_L1", "mean"),
-        mlp_prim_hit_L1_std=("mlp_prim_hit_L1", "std"),
+        mlp_prim_hit_input_L1_mean=("mlp_prim_hit_input_L1", "mean"),
+        mlp_prim_best_input_L1_mean=("mlp_prim_best_input_L1", "mean"),
 
-        mlp_prim_best_acc_L1_mean=("mlp_prim_best_acc_L1", "mean"),
-        mlp_prim_best_acc_L1_std=("mlp_prim_best_acc_L1", "std"),
+        mlp_prim_exact_L1_mean=("mlp_prim_exact_L1", "mean"),
+        mlp_prim_best_L1_mean=("mlp_prim_best_L1", "mean"),
+        mlp_prim_exact_avg_mean=("mlp_prim_exact_avg", "mean"),
+        mlp_prim_best_avg_mean=("mlp_prim_best_avg", "mean"),
 
-        # NEW across layers
-        mlp_prim_exact_avg_layers_mean=("mlp_prim_exact_avg_layers", "mean"),
-        mlp_prim_exact_avg_layers_std=("mlp_prim_exact_avg_layers", "std"),
-        mlp_prim_best_acc_avg_layers_mean=("mlp_prim_best_acc_avg_layers", "mean"),
-        mlp_prim_best_acc_avg_layers_std=("mlp_prim_best_acc_avg_layers", "std"),
-
-        # overlaps
-        gate_overlap_path_mean=("gate_overlap_path_vs_mlpL1", "mean"),
-        gate_overlap_path_std=("gate_overlap_path_vs_mlpL1", "std"),
-        gate_overlap_all_mean=("gate_overlap_all_vs_mlpL1", "mean"),
-        gate_overlap_all_std=("gate_overlap_all_vs_mlpL1", "std"),
-
-        mean_label_tok=("mean_label_tok", "mean"),
-        mean_ubc_tok=("mean_ubc_tok", "mean"),
-        mean_mlp_tok=("mean_mlp_tok", "mean"),
+        overlap_path_vs_mlpAll_mean=("overlap_path_vs_mlpAll", "mean"),
+        overlap_all_vs_mlpAll_mean=("overlap_all_vs_mlpAll", "mean"),
+        overlap_path_vs_mlpPath_mean=("overlap_path_vs_mlpPath", "mean"),
+        overlap_all_vs_mlpPath_mean=("overlap_all_vs_mlpPath", "mean"),
 
         avg_mlp_params_mean=("avg_mlp_params", "mean"),
     ).reset_index()
 
     g.to_csv(out / "meta_groups.csv", index=False)
 
-    # Gate stats CSVs
+    # gate stats CSVs
     df_gates = pd.DataFrame(rows_gate_stats_long)
     df_gates.to_csv(out / "gate_stats_long.csv", index=False)
 
-    # Aggregate gate stats by match_mode + source + gate
     if not df_gates.empty:
         df_gm = df_gates.groupby(["match_mode", "source", "gate"], as_index=False)["count"].sum()
-        # recompute fraction within (match_mode, source)
         df_gm["total"] = df_gm.groupby(["match_mode", "source"])["count"].transform("sum")
         df_gm["frac"] = df_gm["count"] / df_gm["total"].clip(lower=1)
         df_gm = df_gm.sort_values(["match_mode", "source", "frac"], ascending=[True, True, False])
@@ -358,7 +360,6 @@ def main():
     else:
         (out / "gate_stats_by_mode.csv").write_text("")
 
-    # Console summary
     print("\n=== Joint BNR Analysis (by match_mode) ===")
     print(g.sort_values("match_mode").to_string(index=False, float_format=lambda x: f"{x:.4f}"))
 
