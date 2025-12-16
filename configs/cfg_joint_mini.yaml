@@ -1,0 +1,46 @@
+seed: 1
+gate_set: "16"
+steps: 50
+optimizer: rmsprop
+lr: 0.001
+use_row_L: true
+use_max_L: false
+
+lifting:
+  use: false
+
+anneal:
+  T0: 0.60
+  Tmin: 0.06
+  direction: top_down
+  schedule: cosine
+  phase_scale: 0.5
+  start_frac: 0.0
+
+sigma16:
+  s_start: 0.25
+  s_end:   0.10
+  mode:    "rbf"
+  radius:  0.75
+
+regs:
+  lam_entropy: 1.0e-3
+  lam_div_units: 5.0e-4
+  lam_div_rows: 5.0e-4
+  lam_const16: 0.0
+
+pair:
+  route: mi_soft
+  prior_strength: 2.0
+  mi_disjoint: true
+  repel: false
+  mode: "log"
+  eta: 2.0
+
+early_stop:
+  use: true
+  metric: em
+  target: 1.0
+  min_steps: 10
+  check_every: 5
+  patience_checks: 2
