@@ -14,6 +14,7 @@ import torch.optim as optim
 import yaml
 
 from .modules import DepthStack
+from .readout import compose_readout_expr, decoded_readout_metrics, normalize_expr
 from .utils import seed_all, safe_bce, make_async_taus, regularizers_bundle
 from . import tasks as T
 from .boolean_prims16 import set_sigma16_mode, set_sigma16_radius
@@ -409,6 +410,18 @@ def train_single_instance(
     with torch.no_grad():
         y_pred, dbg, final_taus = last_dbg
         row_acc, em = per_instance_metrics(y_true, y_pred)
+        if gate_set == "16":
+            from .boolean_prims16 import PRIMS16 as PRIMS_LIST
+        else:
+            from .boolean_prims import PRIMS as PRIMS_LIST
+        try:
+            lift_W = model.lift.W.detach() if getattr(model, "lift", None) is not None else None
+            pred_expr_raw = compose_readout_expr(B, dbg, final_taus, PRIMS_LIST, lift_W=lift_W)
+            pred_expr = normalize_expr(pred_expr_raw)
+            decoded_row_acc, decoded_em = decoded_readout_metrics(B, pred_expr_raw, y_true)
+        except Exception:
+            pred_expr = ""
+            decoded_row_acc, decoded_em = 0.0, 0
         try:
             gate_usage = extract_gate_usage_from_dbg(dbg, final_taus, PRIMS_LIST)
         except Exception:
@@ -419,7 +432,10 @@ def train_single_instance(
         "S_base": S_base, "L_base": L_base,
         "S_used": S_used, "L_used": L_used,
         "row_acc": row_acc, "em": em,
+        "decoded_row_acc": decoded_row_acc, "decoded_em": decoded_em,
         "formula": formula,
+        "label_expr": normalize_expr(formula),
+        "pred_expr": pred_expr,
         "gate_usage": gate_usage,
     }
 
@@ -458,11 +474,14 @@ def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
               f"B={res['B']}  "
               f"S:{res['S_base']}-> {res['S_used']}  "
               f"L:{res['L_base']}-> {res['L_used']}  "
-              f"acc={res['row_acc']:.3f}  EM={res['em']}")
+              f"acc={res['row_acc']:.3f}  EM={res['em']}  "
+              f"decoded_acc={res['decoded_row_acc']:.3f}  decoded_EM={res['decoded_em']}")
 
     n = max(1, len(results))
     avg_row_acc = sum(r["row_acc"] for r in results) / n
     em_rate     = sum(r["em"]      for r in results) / n
+    avg_decoded_row_acc = sum(r["decoded_row_acc"] for r in results) / n
+    decoded_em_rate     = sum(r["decoded_em"]      for r in results) / n
 
     out_dir.mkdir(parents=True, exist_ok=True)
     summary = {
@@ -470,6 +489,8 @@ def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
         "l_strategy": l_strategy,
         "avg_row_acc": avg_row_acc,
         "em_rate": em_rate,
+        "avg_decoded_row_acc": avg_decoded_row_acc,
+        "decoded_em_rate": decoded_em_rate,
         "results": results,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
@@ -556,9 +577,27 @@ def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
     with torch.no_grad():
         y_pred, dbg, final_taus = last_dbg
         row_acc, em = per_instance_metrics(y_true, y_pred)
+        if str(cfg.get("gate_set", "6")) == "16":
+            from .boolean_prims16 import PRIMS16 as PRIMS_LIST
+        else:
+            from .boolean_prims import PRIMS as PRIMS_LIST
+        lift_W = model.lift.W.detach() if getattr(model, "lift", None) is not None else None
+        pred_expr_raw = compose_readout_expr(2, dbg, final_taus, PRIMS_LIST, lift_W=lift_W)
+        pred_expr = normalize_expr(pred_expr_raw)
+        decoded_row_acc, decoded_em = decoded_readout_metrics(2, pred_expr_raw, y_true)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    summary = {"config": cfg, "row_acc": row_acc, "em": em, "S_used": S_used, "L_used": L_used}
+    summary = {
+        "config": cfg,
+        "row_acc": row_acc,
+        "em": em,
+        "decoded_row_acc": decoded_row_acc,
+        "decoded_em": decoded_em,
+        "label_expr": normalize_expr(cfg["task"]),
+        "pred_expr": pred_expr,
+        "S_used": S_used,
+        "L_used": L_used,
+    }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     print(f"\nSaved summary to: {out_dir / 'summary.json'}")
     return summary

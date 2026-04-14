@@ -38,6 +38,12 @@ import torch.nn as nn
 import torch.optim as optim
 
 from .modules import DepthStack
+from .readout import (
+    compose_readout_expr,
+    decoded_readout_metrics,
+    expr_complexity as readout_expr_complexity,
+    normalize_expr as normalize_readout_expr,
+)
 from . import tasks as T
 from .utils import seed_all, safe_bce, make_async_taus, regularizers_bundle
 from .train import (
@@ -635,6 +641,8 @@ def extract_boolean_expr_from_mlp(
 class UBCOut:
     row_acc: float
     em: int
+    decoded_row_acc: float
+    decoded_em: int
     dbg: List[tuple]
     taus: List[float]
     pred_expr: str
@@ -734,12 +742,17 @@ def train_ubc_instance(device: torch.device, cfg: Dict[str, Any], inst: Dict[str
         else:
             from .boolean_prims import PRIMS as PRIMS
 
-        pred_expr = normalize_expr(compose_readout_ubc(B, dbg, final_taus, PRIMS))
+        lift_W = model.lift.W.detach() if getattr(model, "lift", None) is not None else None
+        pred_expr_raw = compose_readout_expr(B, dbg, final_taus, PRIMS, lift_W=lift_W)
+        pred_expr = normalize_readout_expr(pred_expr_raw)
+        decoded_row_acc, decoded_em = decoded_readout_metrics(B, pred_expr_raw, y_true)
         gate_usage = extract_gate_usage_from_dbg(dbg, final_taus, PRIMS)
 
     return UBCOut(
         row_acc=row_acc,
         em=em,
+        decoded_row_acc=decoded_row_acc,
+        decoded_em=decoded_em,
         dbg=dbg,
         taus=final_taus,
         pred_expr=pred_expr,
@@ -883,7 +896,7 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
         S_used = apply_scale(S_base, args.S_op, args.S_k, args.S_min, args.S_max)
         L_used = apply_scale(L_base, args.L_op, args.L_k, args.L_min, args.L_max)
 
-        label_expr = normalize_expr(str(inst["formula"]))
+        label_expr = normalize_readout_expr(str(inst["formula"]))
 
         gate_set = str(cfg.get("gate_set", "6"))
         pair_cfg = dict(cfg.get("pair", {}))
@@ -906,9 +919,9 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
         )
 
         # lengths
-        lab_char, lab_tok = expr_complexity(label_expr)
-        ubc_char, ubc_tok = expr_complexity(ubc.pred_expr)
-        mlp_char, mlp_tok = expr_complexity(mlp.mlp_expr)
+        lab_char, lab_tok = readout_expr_complexity(label_expr)
+        ubc_char, ubc_tok = readout_expr_complexity(ubc.pred_expr)
+        mlp_char, mlp_tok = readout_expr_complexity(mlp.mlp_expr)
 
         # shortest (token then char)
         ranks = {
@@ -928,6 +941,8 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
             "ubc": {
                 "em": ubc.em,
                 "row_acc": ubc.row_acc,
+                "decoded_em": ubc.decoded_em,
+                "decoded_row_acc": ubc.decoded_row_acc,
                 "pred_expr": ubc.pred_expr,
                 "gate_usage": ubc.gate_usage,
                 "n_soft_params": ubc_soft,
@@ -970,6 +985,7 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
             "L_used": L_used,
 
             "ubc_em": ubc.em,
+            "ubc_decoded_em": ubc.decoded_em,
             "mlp_em": mlp.em,
 
             "bnr_exact_L1": bnr_exact_L1,
@@ -991,8 +1007,10 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
 
         # aggregates
         agg["ubc_em"].append(float(ubc.em))
+        agg["ubc_decoded_em"].append(float(ubc.decoded_em))
         agg["mlp_em"].append(float(mlp.em))
         agg["ubc_row_acc"].append(float(ubc.row_acc))
+        agg["ubc_decoded_row_acc"].append(float(ubc.decoded_row_acc))
         agg["mlp_row_acc"].append(float(mlp.row_acc))
 
         agg["mlp_params"].append(float(mlp.n_params))
@@ -1007,7 +1025,8 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
 
         print(
             f"[{idx+1}/{len(insts)}] B={B} S={S_used} L={L_used} | "
-            f"UBC EM={ubc.em} acc={ubc.row_acc:.3f} | "
+            f"UBC EM={ubc.em} decodedEM={ubc.decoded_em} "
+            f"acc={ubc.row_acc:.3f} decodedAcc={ubc.decoded_row_acc:.3f} | "
             f"MLP({args.mlp_match}) EM={mlp.em} acc={mlp.row_acc:.3f} | "
             f"BNR(L1)={bnr_exact_L1:.3f}/{bnr_eps_L1:.3f} primHit(L1)={mlp.primitive_hit_rate_L1:.3f} | "
             f"shortest={shortest}"
@@ -1024,7 +1043,7 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
     with expr_csv.open("w") as f:
         cols = [
             "idx","B","S_used","L_used",
-            "ubc_em","mlp_em",
+            "ubc_em","ubc_decoded_em","mlp_em",
             "bnr_exact_L1","bnr_eps_L1","prim_hit_L1","prim_best_acc_L1",
             "mlp_expr_fit_acc",
             "label_tok","label_char","ubc_tok","ubc_char","mlp_tok","mlp_char","shortest",
@@ -1034,7 +1053,7 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
         for r in expr_rows:
             f.write(",".join([
                 str(r["idx"]), str(r["B"]), str(r["S_used"]), str(r["L_used"]),
-                str(r["ubc_em"]), str(r["mlp_em"]),
+                str(r["ubc_em"]), str(r["ubc_decoded_em"]), str(r["mlp_em"]),
                 f"{r['bnr_exact_L1']:.6f}", f"{r['bnr_eps_L1']:.6f}",
                 f"{r['prim_hit_L1']:.6f}", f"{r['prim_best_acc_L1']:.6f}",
                 f"{r['mlp_expr_fit_acc']:.6f}",
@@ -1055,8 +1074,10 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
         },
         "means": {
             "ubc_em_rate": float(sum(agg["ubc_em"]) / n),
+            "ubc_decoded_em_rate": float(sum(agg["ubc_decoded_em"]) / n),
             "mlp_em_rate": float(sum(agg["mlp_em"]) / n),
             "ubc_row_acc": float(sum(agg["ubc_row_acc"]) / n),
+            "ubc_decoded_row_acc": float(sum(agg["ubc_decoded_row_acc"]) / n),
             "mlp_row_acc": float(sum(agg["mlp_row_acc"]) / n),
             "mlp_params": float(sum(agg["mlp_params"]) / n),
             "ubc_soft_params": float(sum(agg["ubc_soft_params"]) / n),
