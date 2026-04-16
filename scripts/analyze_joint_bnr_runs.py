@@ -21,6 +21,7 @@ MLP fields used:
   - prim_exact_per_layer, prim_best_acc_per_layer, prim_exact_avg, prim_best_acc_avg (layerwise primitive probe)
   - gate_hist_exact_L1, gate_hist_exact_all, gate_hist_exact_path
 UBC fields used:
+  - em, row_acc, decoded_em, decoded_row_acc
   - gate_usage.path_counts, gate_usage.all_unit_counts
 """
 
@@ -126,6 +127,9 @@ def main():
         seed = parse_seed_from_path(run_dir)
 
         ubc_em = []
+        ubc_row_acc = []
+        ubc_decoded_em = []
+        ubc_decoded_row_acc = []
         mlp_em = []
 
         # BNR (L1 + avg)
@@ -170,6 +174,11 @@ def main():
                 m = r.get("mlp", {}) or {}
 
                 ubc_em.append(float(u.get("em", 0)))
+                ubc_row_acc.append(float(u.get("row_acc", 0)))
+                if "decoded_em" in u:
+                    ubc_decoded_em.append(float(u.get("decoded_em", 0)))
+                if "decoded_row_acc" in u:
+                    ubc_decoded_row_acc.append(float(u.get("decoded_row_acc", 0)))
                 mlp_em.append(float(m.get("em", 0)))
 
                 # ---- BNR ----
@@ -239,6 +248,9 @@ def main():
             "n_instances": n_inst,
 
             "ubc_em_rate": safe_mean(ubc_em),
+            "ubc_row_acc": safe_mean(ubc_row_acc),
+            "ubc_decoded_em_rate": safe_mean(ubc_decoded_em),
+            "ubc_decoded_row_acc": safe_mean(ubc_decoded_row_acc),
             "mlp_em_rate": safe_mean(mlp_em),
 
             # BNR
@@ -321,6 +333,10 @@ def main():
         n_runs=("run_dir", "count"),
         ubc_em_mean=("ubc_em_rate", "mean"),
         ubc_em_std=("ubc_em_rate", "std"),
+        ubc_row_acc_mean=("ubc_row_acc", "mean"),
+        ubc_decoded_em_mean=("ubc_decoded_em_rate", "mean"),
+        ubc_decoded_em_std=("ubc_decoded_em_rate", "std"),
+        ubc_decoded_row_acc_mean=("ubc_decoded_row_acc", "mean"),
         mlp_em_mean=("mlp_em_rate", "mean"),
         mlp_em_std=("mlp_em_rate", "std"),
 

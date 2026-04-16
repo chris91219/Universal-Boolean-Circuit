@@ -72,6 +72,7 @@ def _infer_variant_meta(run_dir: Path, summary: Dict[str, Any]) -> Tuple[
         "ablations",
         "ablations_opt",
         "bench_pair_sweep",
+        "bench_default_best_main",
         "bench_default",
         "bench_default_g16",
         "mi_ablation",
@@ -162,6 +163,8 @@ def _extract_metrics(summary: Dict[str, Any], run_dir: Path) -> Dict[str, Any]:
     if "avg_row_acc" in summary:
         out["avg_row_acc"] = float(summary.get("avg_row_acc", float("nan")))
         out["em_rate"] = float(summary.get("em_rate", float("nan")))
+        out["avg_decoded_row_acc"] = float(summary.get("avg_decoded_row_acc", float("nan")))
+        out["decoded_em_rate"] = float(summary.get("decoded_em_rate", float("nan")))
         out["equiv_rate"] = float(summary.get("equiv_rate", float("nan")))
         results = summary.get("results", [])
         out["n_instances"] = int(len(results)) if isinstance(results, list) else None
@@ -187,6 +190,9 @@ def _extract_metrics(summary: Dict[str, Any], run_dir: Path) -> Dict[str, Any]:
         out["avg_row_acc"] = float(summary.get("row_acc", float("nan")))
         em = summary.get("em", None)
         out["em_rate"] = float(em) if isinstance(em, (int, float)) else float("nan")
+        decoded_em = summary.get("decoded_em", None)
+        out["decoded_em_rate"] = float(decoded_em) if isinstance(decoded_em, (int, float)) else float("nan")
+        out["avg_decoded_row_acc"] = float(summary.get("decoded_row_acc", float("nan")))
         out["equiv_rate"] = out["em_rate"]
         out["simpler_pred"] = out["simpler_label"] = out["simpler_tie"] = out["simpler_same"] = 0
         out["ratio_pred"] = out["ratio_label"] = out["ratio_tie"] = out["ratio_same"] = 0.0
@@ -264,7 +270,7 @@ def main():
     fieldnames_runs = [
         "folder_root", "variant", "gate_set", "route", "repel", "mode", "eta", "lam_const16",
         "seed", "run_dir",
-        "avg_row_acc", "em_rate", "equiv_rate", "n_instances",
+        "avg_row_acc", "em_rate", "avg_decoded_row_acc", "decoded_em_rate", "equiv_rate", "n_instances",
         "simpler_pred", "simpler_label", "simpler_tie", "simpler_same",
         "ratio_pred", "ratio_label", "ratio_tie", "ratio_same",
     ]
@@ -299,10 +305,14 @@ def main():
         seeds = sorted(set(it.get("seed") for it in items if it.get("seed") is not None))
         ems = [it["em_rate"] for it in items]
         accs = [it["avg_row_acc"] for it in items]
+        decoded_ems = [it["decoded_em_rate"] for it in items]
+        decoded_accs = [it["avg_decoded_row_acc"] for it in items]
         eqvs = [it["equiv_rate"] for it in items]
 
         em_mean, em_std = _mean_std(ems)
         acc_mean, acc_std = _mean_std(accs)
+        decoded_em_mean, decoded_em_std = _mean_std(decoded_ems)
+        decoded_acc_mean, decoded_acc_std = _mean_std(decoded_accs)
         eqv_mean, eqv_std = _mean_std(eqvs)
 
         # Sum counts across runs
@@ -328,6 +338,10 @@ def main():
             "em_std": em_std,
             "avg_row_acc_mean": acc_mean,
             "avg_row_acc_std": acc_std,
+            "decoded_em_mean": decoded_em_mean,
+            "decoded_em_std": decoded_em_std,
+            "avg_decoded_row_acc_mean": decoded_acc_mean,
+            "avg_decoded_row_acc_std": decoded_acc_std,
             "equiv_rate_mean": eqv_mean,
             "equiv_rate_std": eqv_std,
             "n_instances_total": n_instances_total,
@@ -344,6 +358,8 @@ def main():
             "num_runs", "num_seeds", "seeds",
             "em_mean", "em_std",
             "avg_row_acc_mean", "avg_row_acc_std",
+            "decoded_em_mean", "decoded_em_std",
+            "avg_decoded_row_acc_mean", "avg_decoded_row_acc_std",
             "equiv_rate_mean", "equiv_rate_std",
             "n_instances_total",
             "simpler_pred_sum", "simpler_label_sum", "simpler_tie_sum", "simpler_same_sum",
@@ -370,12 +386,18 @@ def main():
     best_overall = max(rows, key=_score_tuple)
     best_overall_csv = out_dir / "best_overall.csv"
     with best_overall_csv.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["run_dir", "em_rate", "avg_row_acc", "ratio_pred"])
+        w = csv.DictWriter(f, fieldnames=[
+            "run_dir", "em_rate", "avg_row_acc",
+            "decoded_em_rate", "avg_decoded_row_acc",
+            "ratio_pred",
+        ])
         w.writeheader()
         w.writerow({
             "run_dir": best_overall.get("run_dir", ""),
             "em_rate": best_overall.get("em_rate", ""),
             "avg_row_acc": best_overall.get("avg_row_acc", ""),
+            "decoded_em_rate": best_overall.get("decoded_em_rate", ""),
+            "avg_decoded_row_acc": best_overall.get("avg_decoded_row_acc", ""),
             "ratio_pred": best_overall.get("ratio_pred", ""),
         })
     print(f"[ok] Wrote best overall: {best_overall_csv}")
@@ -413,6 +435,8 @@ def main():
             "run_dir": winner.get("run_dir", ""),
             "em_rate": winner.get("em_rate", ""),
             "avg_row_acc": winner.get("avg_row_acc", ""),
+            "decoded_em_rate": winner.get("decoded_em_rate", ""),
+            "avg_decoded_row_acc": winner.get("avg_decoded_row_acc", ""),
             "ratio_pred": winner.get("ratio_pred", ""),
         })
 
@@ -420,7 +444,9 @@ def main():
     with best_by_setup_csv.open("w", newline="") as f:
         fieldnames = [
             "variant", "gate_set", "route", "repel", "mode", "lam_const16", "eta",
-            "run_dir", "em_rate", "avg_row_acc", "ratio_pred",
+            "run_dir", "em_rate", "avg_row_acc",
+            "decoded_em_rate", "avg_decoded_row_acc",
+            "ratio_pred",
         ]
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
