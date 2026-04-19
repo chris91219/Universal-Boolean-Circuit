@@ -46,9 +46,13 @@ module purge
 module load StdEnv/2023
 module load python/3.11
 
-if [[ -f "${PROJECT_DIR}/ENV/bin/activate" ]]; then
-  source "${PROJECT_DIR}/ENV/bin/activate"
+if [[ ! -f "${PROJECT_DIR}/ENV/bin/activate" ]]; then
+  echo "[error] Missing virtualenv: ${PROJECT_DIR}/ENV/bin/activate"
+  echo "[error] Submit from the repo root or pass PROJECT_DIR=/path/to/Universal-Boolean-Circuit."
+  exit 1
 fi
+source "${PROJECT_DIR}/ENV/bin/activate"
+hash -r
 
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
@@ -149,10 +153,17 @@ echo "[info] out=${RUN_DIR}"
 cd "${PROJECT_DIR}"
 
 python - <<'PY'
-import os, platform
+import os, platform, sys
 print("Python:", platform.python_version())
+print("Python executable:", sys.executable)
 print("PYTHONPATH:", os.environ.get("PYTHONPATH"))
 print("OMP_NUM_THREADS:", os.environ.get("OMP_NUM_THREADS"))
+import torch
+import yaml
+import ubcircuit
+print("torch:", torch.__version__)
+print("yaml:", getattr(yaml, "__version__", "unknown"))
+print("ubcircuit:", getattr(ubcircuit, "__file__", "unknown"))
 PY
 
 python -m ubcircuit.train \
