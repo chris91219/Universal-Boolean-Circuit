@@ -10,7 +10,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --array=0-14
-#SBATCH --output=%x-%A_%a.out
+#SBATCH --output=/scratch/uoftwhli/UBC-Results/slurm-logs/%x-%A_%a.out
 
 set -euo pipefail
 
@@ -40,7 +40,8 @@ else
   PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 fi
 RESULTS_ROOT="${RESULTS_ROOT:-${SCRATCH:-$HOME/scratch}/UBC-Results}"
-mkdir -p "${RESULTS_ROOT}"
+LOG_DIR="${RESULTS_ROOT}/slurm-logs"
+mkdir -p "${RESULTS_ROOT}" "${LOG_DIR}"
 
 module purge
 module load StdEnv/2023

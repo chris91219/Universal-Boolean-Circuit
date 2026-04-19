@@ -12,7 +12,7 @@
 #SBATCH --time=0-01:00:00
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=8G
-#SBATCH --output=%x-%j.out
+#SBATCH --output=/scratch/uoftwhli/UBC-Results/slurm-logs/%x-%j.out
 
 set -euo pipefail
 
@@ -42,6 +42,8 @@ else
   PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 fi
 RESULTS_ROOT="${RESULTS_ROOT:-${SCRATCH:-$HOME/scratch}/UBC-Results}"
+LOG_DIR="${RESULTS_ROOT}/slurm-logs"
+mkdir -p "${RESULTS_ROOT}" "${LOG_DIR}"
 
 MAIN_ROOT="${MAIN_ROOT:-${RESULTS_ROOT}/bench_default_best_main}"
 JOINT_ROOT="${JOINT_ROOT:-${RESULTS_ROOT}/bench_default_best_joint_1216}"
