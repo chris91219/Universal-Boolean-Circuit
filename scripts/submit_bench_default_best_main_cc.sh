@@ -27,8 +27,17 @@ on_exit () {
 }
 trap on_exit EXIT
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# Slurm copies submitted scripts into a spool directory before execution, so
+# BASH_SOURCE points at that copy. SLURM_SUBMIT_DIR is the repo directory when
+# submitted from the project root; PROJECT_DIR can still override explicitly.
+if [[ -n "${PROJECT_DIR:-}" ]]; then
+  PROJECT_DIR="$(cd "${PROJECT_DIR}" && pwd)"
+elif [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+  PROJECT_DIR="$(cd "${SLURM_SUBMIT_DIR}" && pwd)"
+else
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+fi
 RESULTS_ROOT="${RESULTS_ROOT:-${SCRATCH:-$HOME/scratch}/UBC-Results}"
 mkdir -p "${RESULTS_ROOT}"
 
