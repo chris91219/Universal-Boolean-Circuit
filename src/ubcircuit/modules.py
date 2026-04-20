@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from .boolean_prims import Rep2, sigma as sigma6
 from .boolean_prims16 import sigma16
 from .fixed_selector import FixedPairSelector
-from .utils import clamp01
+from .utils import categorical_relaxation, clamp01
 from .lifting import BitLifting   # NEW: lifting layer
 
 
@@ -28,6 +28,10 @@ class BooleanUnit(nn.Module):
         self.W = nn.Parameter(1e-3 * torch.randn(self.K))
         self.tau = float(tau)
         self.s16 = float(s16)
+        self.relax_mode = "softmax"
+        self.relax_hard = False
+        self.gumbel_tau = 1.0
+        self.eval_hard = False
 
     def set_sigma16_bandwidth(self, s: float) -> None:
         self.s16 = float(s)
@@ -35,12 +39,30 @@ class BooleanUnit(nn.Module):
     def set_tau(self, tau: float) -> None:
         self.tau = float(tau)
 
+    def set_relaxation(
+        self,
+        mode: str = "softmax",
+        hard: bool = False,
+        gumbel_tau: float = 1.0,
+        eval_hard: bool = False,
+    ) -> None:
+        self.relax_mode = str(mode or "softmax")
+        self.relax_hard = bool(hard)
+        self.gumbel_tau = float(gumbel_tau)
+        self.eval_hard = bool(eval_hard)
+
     def forward(self, x2: torch.Tensor) -> torch.Tensor:
         if self.gate_set == "16":
             feats = sigma16(x2, s=self.s16)                    # (B,16)  smooth in x
         else:
             feats = sigma6(Rep2(x2))                           # (B,6)   piecewise-smooth
-        p = F.softmax(self.W / max(self.tau, 1e-8), dim=0)     # (K,)
+        p = categorical_relaxation(
+            self.W / max(self.tau, 1e-8),
+            mode=self.relax_mode,
+            hard=self.relax_hard,
+            gumbel_tau=self.gumbel_tau,
+            eval_hard=self.eval_hard,
+        )                                                       # (K,)
         return torch.sum(feats * p, dim=-1, keepdim=True)      # (B,1)
 
 
@@ -76,6 +98,10 @@ class PairSelector(nn.Module):
             self.register_buffer("PR_prior", PR_prior)
         else:
             self.PR_prior = None
+        self.relax_mode = "softmax"
+        self.relax_hard = False
+        self.gumbel_tau = 1.0
+        self.eval_hard = False
 
     def set_repulsion(self, repel: bool = None, eta: float = None, mode: str = None):
         if repel is not None: self.repel = bool(repel)
@@ -86,6 +112,27 @@ class PairSelector(nn.Module):
 
     def set_tau(self, tau: float) -> None:
         self.tau = float(tau)
+
+    def set_relaxation(
+        self,
+        mode: str = "softmax",
+        hard: bool = False,
+        gumbel_tau: float = 1.0,
+        eval_hard: bool = False,
+    ) -> None:
+        self.relax_mode = str(mode or "softmax")
+        self.relax_hard = bool(hard)
+        self.gumbel_tau = float(gumbel_tau)
+        self.eval_hard = bool(eval_hard)
+
+    def _select(self, scaled_logits: torch.Tensor) -> torch.Tensor:
+        return categorical_relaxation(
+            scaled_logits,
+            mode=self.relax_mode,
+            hard=self.relax_hard,
+            gumbel_tau=self.gumbel_tau,
+            eval_hard=self.eval_hard,
+        )
 
     def forward(self, xB: torch.Tensor) -> torch.Tensor:
         """
@@ -99,7 +146,7 @@ class PairSelector(nn.Module):
         # (optional) soft MI prior in log-space
         if getattr(self, "PL_prior", None) is not None and self.prior_strength > 0.0:
             PL_logits = PL_logits + self.prior_strength * torch.log(clamp01(self.PL_prior))
-        PL = F.softmax(PL_logits, dim=-1)                               # (S,B)
+        PL = self._select(PL_logits)                                    # (S,B)
 
         # Indices + masks used by "hard-*" modes to forbid doubled edges
         left_idx = PL.argmax(dim=-1)                                    # (S,)
@@ -124,11 +171,11 @@ class PairSelector(nn.Module):
                 if mode == "hard-log":
                     PR_logits = PR_logits + mask_logit
 
-                PR = F.softmax(PR_logits, dim=-1)                       # (S,B)
+                PR = self._select(PR_logits)                            # (S,B)
 
             elif mode in {"mul", "hard-mul"}:
                 # prob-space repulsion: scale probs by (1 - PL)
-                w2 = F.softmax(self.PR / temp, dim=-1)                  # (S,B)
+                w2 = self._select(self.PR / temp)                       # (S,B)
                 # (optional) soft MI prior in prob-space
                 if getattr(self, "PR_prior", None) is not None and self.prior_strength > 0.0:
                     # raise prior to strength, then renorm later
@@ -145,9 +192,9 @@ class PairSelector(nn.Module):
 
             else:
                 # should not happen (assert in __init__), but keep a safe fallback
-                PR = F.softmax(self.PR / temp, dim=-1)
+                PR = self._select(self.PR / temp)
         else:
-            PR = F.softmax(self.PR / temp, dim=-1)
+            PR = self._select(self.PR / temp)
 
         # -------- Gather pairs and return --------
         a = xB @ PL.t()                                                 # (batch,S)
@@ -171,11 +218,38 @@ class ReasoningLayer(nn.Module):
         self.WL = nn.Parameter(1e-3 * torch.randn(out_bits, S))  # row-softmax over S
         self.tau = float(tau)
         self.out_bits = int(out_bits)
+        self.relax_mode = "softmax"
+        self.relax_hard = False
+        self.gumbel_tau = 1.0
+        self.eval_hard = False
 
     def set_tau(self, tau: float) -> None:
         self.tau = float(tau)
         for u in self.units:
             u.set_tau(tau)
+
+    def set_relaxation(
+        self,
+        mode: str = "softmax",
+        hard: bool = False,
+        gumbel_tau: float = 1.0,
+        eval_hard: bool = False,
+    ) -> None:
+        self.relax_mode = str(mode or "softmax")
+        self.relax_hard = bool(hard)
+        self.gumbel_tau = float(gumbel_tau)
+        self.eval_hard = bool(eval_hard)
+        for u in self.units:
+            u.set_relaxation(mode, hard=hard, gumbel_tau=gumbel_tau, eval_hard=eval_hard)
+
+    def _select(self, scaled_logits: torch.Tensor) -> torch.Tensor:
+        return categorical_relaxation(
+            scaled_logits,
+            mode=self.relax_mode,
+            hard=self.relax_hard,
+            gumbel_tau=self.gumbel_tau,
+            eval_hard=self.eval_hard,
+        )
 
     def forward(self, x2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
         """
@@ -188,7 +262,7 @@ class ReasoningLayer(nn.Module):
             unitWs: list of each unit.param W (for diagnostics/regularizers)
         """
         outs = torch.cat([u(x2) for u in self.units], dim=-1)      # (B,S)
-        L_rows = F.softmax(self.WL / max(self.tau, 1e-8), dim=-1)  # (out_bits,S)
+        L_rows = self._select(self.WL / max(self.tau, 1e-8))       # (out_bits,S)
         next_bits = [(outs * L_rows[k]).sum(-1, keepdim=True) for k in range(self.out_bits)]
         x_next = torch.cat(next_bits, dim=-1)                      # (B,out_bits)
         unitWs = [u.W for u in self.units]
@@ -212,6 +286,10 @@ class GeneralLayer(nn.Module):
         self.units = nn.ModuleList([BooleanUnit(tau=tau, gate_set=gate_set) for _ in range(S)])
         self.gate_set = gate_set
         self.WL = nn.Parameter(1e-3 * torch.randn(out_bits, S))
+        self.relax_mode = "softmax"
+        self.relax_hard = False
+        self.gumbel_tau = 1.0
+        self.eval_hard = False
         if in_bits > 2:
             pair = pair or {}
             route = pair.get("route", "learned")
@@ -243,8 +321,33 @@ class GeneralLayer(nn.Module):
         self.tau = float(tau)
         for u in self.units:
             u.set_tau(tau)
-        if self.selector is not None:
+        if self.selector is not None and hasattr(self.selector, "set_tau"):
             self.selector.set_tau(tau)
+
+    def set_relaxation(
+        self,
+        mode: str = "softmax",
+        hard: bool = False,
+        gumbel_tau: float = 1.0,
+        eval_hard: bool = False,
+    ) -> None:
+        self.relax_mode = str(mode or "softmax")
+        self.relax_hard = bool(hard)
+        self.gumbel_tau = float(gumbel_tau)
+        self.eval_hard = bool(eval_hard)
+        for u in self.units:
+            u.set_relaxation(mode, hard=hard, gumbel_tau=gumbel_tau, eval_hard=eval_hard)
+        if self.selector is not None and hasattr(self.selector, "set_relaxation"):
+            self.selector.set_relaxation(mode, hard=hard, gumbel_tau=gumbel_tau, eval_hard=eval_hard)
+
+    def _select(self, scaled_logits: torch.Tensor) -> torch.Tensor:
+        return categorical_relaxation(
+            scaled_logits,
+            mode=self.relax_mode,
+            hard=self.relax_hard,
+            gumbel_tau=self.gumbel_tau,
+            eval_hard=self.eval_hard,
+        )
 
     def forward(self, x: torch.Tensor):
         # x: (BATCH, in_bits)
@@ -255,17 +358,26 @@ class GeneralLayer(nn.Module):
         else:
             pairs = self.selector(x)                                # (B,S,2)
             outs = torch.cat([self.units[s](pairs[:, s, :]) for s in range(self.S)], dim=-1)  # (B,S)
-        L_rows = F.softmax(self.WL / max(self.tau, 1e-8), dim=-1)   # (out_bits,S)
+        L_rows = self._select(self.WL / max(self.tau, 1e-8))        # (out_bits,S)
         next_bits = [(outs * L_rows[k]).sum(-1, keepdim=True) for k in range(self.out_bits)]
         x_next = torch.cat(next_bits, dim=-1)                        # (B,out_bits)
         unitWs = [u.W for u in self.units]
 
         temp = max(self.tau, 1e-8)
-        PL_dbg = F.softmax(self.selector.PL / temp, dim=-1) if self.selector is not None else None
+        if self.selector is None:
+            PL_dbg = None
+        elif hasattr(self.selector, "PL"):
+            PL_dbg = self.selector._select(self.selector.PL / temp)
+        elif hasattr(self.selector, "PL_fix"):
+            PL_dbg = self.selector.PL_fix
+        else:
+            PL_dbg = None
         if self.selector is None:
             PR_dbg = None
+        elif hasattr(self.selector, "PR_fix"):
+            PR_dbg = self.selector.PR_fix
         elif not self.selector.repel:
-            PR_dbg = F.softmax(self.selector.PR / temp, dim=-1)
+            PR_dbg = self.selector._select(self.selector.PR / temp)
         else:
             mode = self.selector.repel_mode
             if mode in {"log", "hard-log"}:
@@ -276,9 +388,9 @@ class GeneralLayer(nn.Module):
                     mask_logit_dbg = torch.full_like(self.selector.PR, 0.0)
                     mask_logit_dbg.scatter_(1, left_idx_dbg.view(-1,1), float('-inf'))
                     PR_logits = PR_logits + mask_logit_dbg
-                PR_dbg = F.softmax(PR_logits, dim=-1)
+                PR_dbg = self.selector._select(PR_logits)
             else:  # "mul" or "hard-mul"
-                w2 = F.softmax(self.selector.PR / temp, dim=-1)
+                w2 = self.selector._select(self.selector.PR / temp)
                 gate = (1.0 - PL_dbg)
                 pR_unnorm = self.selector.repel_eta * gate * w2
                 if mode == "hard-mul":
@@ -364,6 +476,17 @@ class DepthStack(nn.Module):
                 for u in lyr.units:
                     if getattr(u, "gate_set", "6") == "16":
                         u.set_sigma16_bandwidth(s)
+
+    def set_relaxation(
+        self,
+        mode: str = "softmax",
+        hard: bool = False,
+        gumbel_tau: float = 1.0,
+        eval_hard: bool = False,
+    ) -> None:
+        for layer in self.layers:
+            if hasattr(layer, "set_relaxation"):
+                layer.set_relaxation(mode, hard=hard, gumbel_tau=gumbel_tau, eval_hard=eval_hard)
 
     def forward(self, xB: torch.Tensor):
         """

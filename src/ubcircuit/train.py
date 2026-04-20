@@ -15,7 +15,7 @@ import yaml
 
 from .modules import DepthStack
 from .readout import compose_readout_expr, decoded_readout_metrics, normalize_expr
-from .utils import seed_all, safe_bce, make_async_taus, regularizers_bundle
+from .utils import seed_all, stable_seed, safe_bce, make_async_taus, regularizers_bundle
 from . import tasks as T
 from .boolean_prims16 import set_sigma16_mode, set_sigma16_radius
 from .mi import top_mi_pairs, priors_from_pairs
@@ -33,6 +33,12 @@ DEFAULT_CFG: Dict[str, Any] = {
         "radius": 0.75,
     },
     "lifting": {"use": True, "factor": 2.0},
+    "relaxation": {
+        "mode": "softmax",       # "softmax" | "gumbel" | "argmax_ste"
+        "hard": False,           # straight-through one-hot for gumbel/argmax_ste training
+        "gumbel_tau": 1.0,
+        "eval_hard": False,      # deterministic one-hot during no-grad/eval forwards
+    },
     "steps": 1200,
     "lr": 0.05,
     "optimizer": "rmsprop",
@@ -82,7 +88,7 @@ DEFAULT_CFG: Dict[str, Any] = {
     "dataset": None,
     "early_stop": {
         "use": True,
-        "metric": "em",
+        "metric": "decoded_em",
         "target": 1.0,
         "min_steps": 100,
         "check_every": 10,
@@ -96,7 +102,7 @@ def load_config(path: str | None) -> Dict[str, Any]:
     if path:
         user = yaml.safe_load(open(path)) or {}
         for k, v in user.items():
-            if isinstance(v, dict) and k in {"anneal", "regs", "aux", "early_stop", "pair", "sigma16", "lifting", "scale"}:
+            if isinstance(v, dict) and k in {"anneal", "regs", "aux", "early_stop", "pair", "sigma16", "lifting", "scale", "relaxation"}:
                 cfg[k] = {**cfg[k], **v}
             else:
                 cfg[k] = v
@@ -115,6 +121,190 @@ def per_instance_metrics(y_true: torch.Tensor, y_pred: torch.Tensor) -> Tuple[fl
     row_acc = (yb.eq(y_true)).float().mean().item()
     em = int(torch.all(yb.eq(y_true)).item())
     return row_acc, em
+
+
+def configure_model_relaxation(model: torch.nn.Module, cfg: Dict[str, Any]) -> None:
+    rel = cfg.get("relaxation", {}) or {}
+    if hasattr(model, "set_relaxation"):
+        model.set_relaxation(
+            mode=str(rel.get("mode", "softmax")),
+            hard=bool(rel.get("hard", False)),
+            gumbel_tau=float(rel.get("gumbel_tau", 1.0)),
+            eval_hard=bool(rel.get("eval_hard", False)),
+        )
+
+
+def set_model_schedule(
+    model: torch.nn.Module,
+    cfg: Dict[str, Any],
+    gate_set: str,
+    step: int,
+    total: int,
+) -> List[float]:
+    anneal_cfg = cfg["anneal"]
+    taus = make_async_taus(
+        L=len(model.layers), step=step, total=total,
+        T0=anneal_cfg["T0"], Tmin=anneal_cfg["Tmin"],
+        direction=anneal_cfg["direction"],
+        schedule=anneal_cfg.get("schedule", "linear"),
+        phase_scale=anneal_cfg.get("phase_scale", 0.4),
+        start_frac=anneal_cfg.get("start_frac", 0.0),
+    )
+    if hasattr(model, "set_layer_taus_and_bandwidths") and gate_set == "16":
+        s_cfg = cfg.get("sigma16", {})
+        s_start = float(s_cfg.get("s_start", 0.25))
+        s_end = float(s_cfg.get("s_end", 0.10))
+        model.set_layer_taus_and_bandwidths(taus, s_start=s_start, s_end=s_end)
+    else:
+        model.set_layer_taus(taus)
+    return taus
+
+
+def decode_from_dbg(
+    B: int,
+    y_true: torch.Tensor,
+    dbg: List[tuple],
+    taus: List[float],
+    PRIMS: List[str],
+    lift_W: torch.Tensor | None = None,
+) -> Tuple[str, float, int]:
+    pred_expr_raw = compose_readout_expr(B, dbg, taus, PRIMS, lift_W=lift_W)
+    pred_expr = normalize_expr(pred_expr_raw)
+    decoded_row_acc, decoded_em = decoded_readout_metrics(B, pred_expr_raw, y_true)
+    return pred_expr, decoded_row_acc, decoded_em
+
+
+def early_stop_metric_value(
+    metric: str,
+    *,
+    row_acc: float,
+    em: int,
+    decoded_row_acc: float,
+    decoded_em: int,
+) -> float:
+    metric = str(metric or "decoded_em").lower()
+    if metric in {"em", "soft_em"}:
+        return float(em)
+    if metric in {"row_acc", "acc", "soft_row_acc"}:
+        return float(row_acc)
+    if metric in {"decoded_em", "hard_em", "readout_em"}:
+        return float(decoded_em)
+    if metric in {"decoded_row_acc", "decoded_acc", "hard_row_acc", "readout_row_acc"}:
+        return float(decoded_row_acc)
+    if metric in {"both_em", "soft_and_decoded_em"}:
+        return float(min(int(em), int(decoded_em)))
+    raise ValueError(
+        f"Unknown early_stop.metric={metric!r}. "
+        "Use em|row_acc|decoded_em|decoded_row_acc|both_em."
+    )
+
+
+def _dist_stats(prefix: str, probs: List[torch.Tensor]) -> Dict[str, float]:
+    rows = []
+    for p in probs:
+        if not isinstance(p, torch.Tensor) or p.numel() == 0:
+            continue
+        q = p.detach().float()
+        if q.dim() == 1:
+            q = q.unsqueeze(0)
+        rows.append(q.reshape(-1, q.shape[-1]))
+    if not rows:
+        return {
+            f"{prefix}_count": 0,
+            f"{prefix}_entropy_mean": float("nan"),
+            f"{prefix}_entropy_max": float("nan"),
+            f"{prefix}_max_prob_mean": float("nan"),
+            f"{prefix}_max_prob_min": float("nan"),
+            f"{prefix}_margin_mean": float("nan"),
+            f"{prefix}_margin_min": float("nan"),
+        }
+    q = torch.cat(rows, dim=0).clamp_min(1e-12)
+    ent = -(q * q.log()).sum(dim=-1)
+    top = torch.topk(q, k=min(2, q.shape[-1]), dim=-1).values
+    max_prob = top[:, 0]
+    margin = top[:, 0] - (top[:, 1] if top.shape[-1] > 1 else 0.0)
+    return {
+        f"{prefix}_count": int(q.shape[0]),
+        f"{prefix}_entropy_mean": float(ent.mean().item()),
+        f"{prefix}_entropy_max": float(ent.max().item()),
+        f"{prefix}_max_prob_mean": float(max_prob.mean().item()),
+        f"{prefix}_max_prob_min": float(max_prob.min().item()),
+        f"{prefix}_margin_mean": float(margin.mean().item()),
+        f"{prefix}_margin_min": float(margin.min().item()),
+    }
+
+
+def ubc_diagnostics_from_dbg(
+    dbg: List[tuple],
+    taus: List[float],
+    *,
+    y_pred: torch.Tensor | None = None,
+    y_true: torch.Tensor | None = None,
+) -> Dict[str, Any]:
+    gate_probs: List[torch.Tensor] = []
+    row_probs: List[torch.Tensor] = []
+    pair_probs: List[torch.Tensor] = []
+    for li, (_outs, Lrows, unitWs, PL, PR) in enumerate(dbg):
+        tau = float(taus[li])
+        row_probs.append(Lrows)
+        for W in unitWs:
+            gate_probs.append(torch.softmax(W.detach() / max(tau, 1e-8), dim=0))
+        if isinstance(PL, torch.Tensor):
+            pair_probs.append(PL)
+        if isinstance(PR, torch.Tensor):
+            pair_probs.append(PR)
+
+    out: Dict[str, Any] = {
+        "tau_min": float(min(taus)) if taus else float("nan"),
+        "tau_max": float(max(taus)) if taus else float("nan"),
+    }
+    out.update(_dist_stats("gate", gate_probs))
+    out.update(_dist_stats("row", row_probs))
+    out.update(_dist_stats("pair", pair_probs))
+
+    if y_pred is not None:
+        margin = (y_pred.detach().float() - 0.5).abs()
+        out["output_margin_mean"] = float(margin.mean().item())
+        out["output_margin_min"] = float(margin.min().item())
+    if y_pred is not None and y_true is not None:
+        out["bce"] = float(safe_bce(y_pred.detach().float(), y_true.detach().float()).item())
+    return out
+
+
+def evaluate_ubc_model(
+    model: torch.nn.Module,
+    cfg: Dict[str, Any],
+    *,
+    B: int,
+    X: torch.Tensor,
+    y_true: torch.Tensor,
+    gate_set: str,
+    PRIMS: List[str],
+    step: int,
+    total: int,
+) -> Dict[str, Any]:
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        taus = set_model_schedule(model, cfg, gate_set, step=step, total=total)
+        y_pred, dbg = model(X)
+        row_acc, em = per_instance_metrics(y_true, y_pred)
+        lift_W = model.lift.W.detach() if getattr(model, "lift", None) is not None else None
+        pred_expr, decoded_row_acc, decoded_em = decode_from_dbg(B, y_true, dbg, taus, PRIMS, lift_W=lift_W)
+        diagnostics = ubc_diagnostics_from_dbg(dbg, taus, y_pred=y_pred, y_true=y_true)
+    if was_training:
+        model.train()
+    return {
+        "y_pred": y_pred,
+        "dbg": dbg,
+        "taus": taus,
+        "row_acc": row_acc,
+        "em": em,
+        "pred_expr": pred_expr,
+        "decoded_row_acc": decoded_row_acc,
+        "decoded_em": decoded_em,
+        "diagnostics": diagnostics,
+    }
 
 
 # ---------- Lifting: effective input width (must match modules.py) ----------
@@ -343,6 +533,7 @@ def train_single_instance(
         use_lifting=use_lifting,
         lift_factor=lift_factor,
     ).to(device)
+    configure_model_relaxation(model, cfg)
 
     opt_name = str(cfg["optimizer"]).lower()
     opt = (
@@ -363,28 +554,13 @@ def train_single_instance(
     target = float(es_cfg.get("target", 1.0))
     ok_streak = 0
 
-    last_dbg = None
+    last_step = 0
     for step in range(steps):
-        taus = make_async_taus(
-            L=len(model.layers), step=step, total=steps,
-            T0=anneal_cfg["T0"], Tmin=anneal_cfg["Tmin"],
-            direction=anneal_cfg["direction"],
-            schedule=anneal_cfg.get("schedule", "linear"),
-            phase_scale=anneal_cfg.get("phase_scale", 0.4),
-            start_frac=anneal_cfg.get("start_frac", 0.0),
-        )
-
-        if hasattr(model, "set_layer_taus_and_bandwidths") and gate_set == "16":
-            s_cfg = cfg.get("sigma16", {})
-            s_start = float(s_cfg.get("s_start", 0.25))
-            s_end   = float(s_cfg.get("s_end", 0.10))
-            model.set_layer_taus_and_bandwidths(taus, s_start=s_start, s_end=s_end)
-        else:
-            model.set_layer_taus(taus)
+        last_step = step
+        taus = set_model_schedule(model, cfg, gate_set, step=step, total=steps)
 
         opt.zero_grad()
         y_pred, dbg = model(X)
-        last_dbg = (y_pred, dbg, taus)
 
         loss = safe_bce(y_pred, y_true)
         dbg_slim = [(d[0], d[1], d[2]) for d in dbg]
@@ -399,33 +575,36 @@ def train_single_instance(
         opt.step()
 
         if use_es and (step + 1) >= min_steps and ((step + 1) % check_every == 0):
-            with torch.no_grad():
-                row_acc, em = per_instance_metrics(y_true, y_pred)
-                cur_val = float(em) if metric == "em" else float(row_acc)
-                ok_streak = (ok_streak + 1) if (cur_val >= target) else 0
-                if ok_streak >= patience_checks:
-                    print(f"  [early-stop] step={step+1}, metric={metric}={cur_val:.3f} (target={target})")
-                    break
+            eval_now = evaluate_ubc_model(
+                model, cfg, B=B, X=X, y_true=y_true, gate_set=gate_set,
+                PRIMS=PRIMS_LIST, step=step, total=steps,
+            )
+            cur_val = early_stop_metric_value(
+                metric,
+                row_acc=eval_now["row_acc"],
+                em=eval_now["em"],
+                decoded_row_acc=eval_now["decoded_row_acc"],
+                decoded_em=eval_now["decoded_em"],
+            )
+            ok_streak = (ok_streak + 1) if (cur_val >= target) else 0
+            if ok_streak >= patience_checks:
+                print(f"  [early-stop] step={step+1}, metric={metric}={cur_val:.3f} (target={target})")
+                break
 
-    with torch.no_grad():
-        y_pred, dbg, final_taus = last_dbg
-        row_acc, em = per_instance_metrics(y_true, y_pred)
-        if gate_set == "16":
-            from .boolean_prims16 import PRIMS16 as PRIMS_LIST
-        else:
-            from .boolean_prims import PRIMS as PRIMS_LIST
-        try:
-            lift_W = model.lift.W.detach() if getattr(model, "lift", None) is not None else None
-            pred_expr_raw = compose_readout_expr(B, dbg, final_taus, PRIMS_LIST, lift_W=lift_W)
-            pred_expr = normalize_expr(pred_expr_raw)
-            decoded_row_acc, decoded_em = decoded_readout_metrics(B, pred_expr_raw, y_true)
-        except Exception:
-            pred_expr = ""
-            decoded_row_acc, decoded_em = 0.0, 0
-        try:
-            gate_usage = extract_gate_usage_from_dbg(dbg, final_taus, PRIMS_LIST)
-        except Exception:
-            gate_usage = {}
+    final_eval = evaluate_ubc_model(
+        model, cfg, B=B, X=X, y_true=y_true, gate_set=gate_set,
+        PRIMS=PRIMS_LIST, step=last_step, total=steps,
+    )
+    row_acc = final_eval["row_acc"]
+    em = final_eval["em"]
+    decoded_row_acc = final_eval["decoded_row_acc"]
+    decoded_em = final_eval["decoded_em"]
+    pred_expr = final_eval["pred_expr"]
+    diagnostics = final_eval["diagnostics"]
+    try:
+        gate_usage = extract_gate_usage_from_dbg(final_eval["dbg"], final_eval["taus"], PRIMS_LIST)
+    except Exception:
+        gate_usage = {}
 
     return {
         "B": B,
@@ -437,6 +616,8 @@ def train_single_instance(
         "label_expr": normalize_expr(formula),
         "pred_expr": pred_expr,
         "gate_usage": gate_usage,
+        "diagnostics": diagnostics,
+        "train_steps": int(last_step + 1),
     }
 
 
@@ -462,6 +643,7 @@ def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
 
     results = []
     for idx, inst in enumerate(insts):
+        seed_all(stable_seed(int(cfg["seed"]), "ubc", idx))
         L_override = None
         if l_strategy == "row" and ("L" in inst):
             L_override = int(inst["L"])
@@ -482,6 +664,17 @@ def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
     em_rate     = sum(r["em"]      for r in results) / n
     avg_decoded_row_acc = sum(r["decoded_row_acc"] for r in results) / n
     decoded_em_rate     = sum(r["decoded_em"]      for r in results) / n
+    diag_keys = sorted({
+        k
+        for r in results
+        for k, v in (r.get("diagnostics") or {}).items()
+        if isinstance(v, (int, float)) and math.isfinite(float(v))
+    })
+    avg_diagnostics = {
+        k: sum(float(r.get("diagnostics", {}).get(k, 0.0)) for r in results if k in r.get("diagnostics", {}))
+        / max(1, sum(1 for r in results if k in r.get("diagnostics", {})))
+        for k in diag_keys
+    }
 
     out_dir.mkdir(parents=True, exist_ok=True)
     summary = {
@@ -491,6 +684,7 @@ def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
         "em_rate": em_rate,
         "avg_decoded_row_acc": avg_decoded_row_acc,
         "decoded_em_rate": decoded_em_rate,
+        "avg_diagnostics": avg_diagnostics,
         "results": results,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
@@ -531,6 +725,12 @@ def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
         use_lifting=use_lifting,
         lift_factor=lift_factor,
     ).to(device)
+    gate_set = str(cfg.get("gate_set", "6"))
+    if gate_set == "16":
+        from .boolean_prims16 import PRIMS16 as PRIMS_LIST
+    else:
+        from .boolean_prims import PRIMS as PRIMS_LIST
+    configure_model_relaxation(model, cfg)
 
     opt = (optim.RMSprop(model.parameters(), lr=cfg["lr"], alpha=0.99, eps=1e-8)
            if cfg["optimizer"].lower() == "rmsprop" else
@@ -538,29 +738,22 @@ def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
 
     steps = int(cfg["steps"])
     regs_cfg = cfg["regs"]
-    anneal_cfg = cfg["anneal"]
+    es_cfg = cfg.get("early_stop", {})
+    use_es = bool(es_cfg.get("use", False))
+    min_steps = int(es_cfg.get("min_steps", 0))
+    check_every = int(es_cfg.get("check_every", 10))
+    patience_checks = int(es_cfg.get("patience_checks", 3))
+    metric = str(es_cfg.get("metric", "decoded_em")).lower()
+    target = float(es_cfg.get("target", 1.0))
+    ok_streak = 0
 
-    last_dbg = None
+    last_step = 0
     for step in range(steps):
-        taus = make_async_taus(
-            L=len(model.layers), step=step, total=steps,
-            T0=anneal_cfg["T0"], Tmin=anneal_cfg["Tmin"],
-            direction=anneal_cfg["direction"],
-            schedule=anneal_cfg.get("schedule", "linear"),
-            phase_scale=anneal_cfg.get("phase_scale", 0.4),
-            start_frac=anneal_cfg.get("start_frac", 0.0),
-        )
-        if hasattr(model, "set_layer_taus_and_bandwidths") and str(cfg.get("gate_set", "6")) == "16":
-            s_cfg = cfg.get("sigma16", {})
-            s_start = float(s_cfg.get("s_start", 0.25))
-            s_end   = float(s_cfg.get("s_end", 0.10))
-            model.set_layer_taus_and_bandwidths(taus, s_start=s_start, s_end=s_end)
-        else:
-            model.set_layer_taus(taus)
+        last_step = step
+        taus = set_model_schedule(model, cfg, gate_set, step=step, total=steps)
 
         opt.zero_grad()
         y_pred, dbg = model(X)
-        last_dbg = (y_pred, dbg, taus)
 
         loss = safe_bce(y_pred, y_true)
         dbg_slim = [(d[0], d[1], d[2]) for d in dbg]
@@ -574,17 +767,33 @@ def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
         (loss + reg).backward()
         opt.step()
 
-    with torch.no_grad():
-        y_pred, dbg, final_taus = last_dbg
-        row_acc, em = per_instance_metrics(y_true, y_pred)
-        if str(cfg.get("gate_set", "6")) == "16":
-            from .boolean_prims16 import PRIMS16 as PRIMS_LIST
-        else:
-            from .boolean_prims import PRIMS as PRIMS_LIST
-        lift_W = model.lift.W.detach() if getattr(model, "lift", None) is not None else None
-        pred_expr_raw = compose_readout_expr(2, dbg, final_taus, PRIMS_LIST, lift_W=lift_W)
-        pred_expr = normalize_expr(pred_expr_raw)
-        decoded_row_acc, decoded_em = decoded_readout_metrics(2, pred_expr_raw, y_true)
+        if use_es and (step + 1) >= min_steps and ((step + 1) % check_every == 0):
+            eval_now = evaluate_ubc_model(
+                model, cfg, B=2, X=X, y_true=y_true, gate_set=gate_set,
+                PRIMS=PRIMS_LIST, step=step, total=steps,
+            )
+            cur_val = early_stop_metric_value(
+                metric,
+                row_acc=eval_now["row_acc"],
+                em=eval_now["em"],
+                decoded_row_acc=eval_now["decoded_row_acc"],
+                decoded_em=eval_now["decoded_em"],
+            )
+            ok_streak = (ok_streak + 1) if (cur_val >= target) else 0
+            if ok_streak >= patience_checks:
+                print(f"  [early-stop] step={step+1}, metric={metric}={cur_val:.3f} (target={target})")
+                break
+
+    final_eval = evaluate_ubc_model(
+        model, cfg, B=2, X=X, y_true=y_true, gate_set=gate_set,
+        PRIMS=PRIMS_LIST, step=last_step, total=steps,
+    )
+    row_acc = final_eval["row_acc"]
+    em = final_eval["em"]
+    decoded_row_acc = final_eval["decoded_row_acc"]
+    decoded_em = final_eval["decoded_em"]
+    pred_expr = final_eval["pred_expr"]
+    diagnostics = final_eval["diagnostics"]
 
     out_dir.mkdir(parents=True, exist_ok=True)
     summary = {
@@ -597,6 +806,8 @@ def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
         "pred_expr": pred_expr,
         "S_used": S_used,
         "L_used": L_used,
+        "diagnostics": diagnostics,
+        "train_steps": int(last_step + 1),
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     print(f"\nSaved summary to: {out_dir / 'summary.json'}")

@@ -39,13 +39,11 @@ import torch.optim as optim
 
 from .modules import DepthStack
 from .readout import (
-    compose_readout_expr,
-    decoded_readout_metrics,
     expr_complexity as readout_expr_complexity,
     normalize_expr as normalize_readout_expr,
 )
 from . import tasks as T
-from .utils import seed_all, safe_bce, make_async_taus, regularizers_bundle
+from .utils import seed_all, stable_seed, safe_bce, regularizers_bundle
 from .train import (
     load_config,
     _device,
@@ -53,6 +51,10 @@ from .train import (
     resolve_pair_cfg,
     compute_B_effective,
     extract_gate_usage_from_dbg,
+    configure_model_relaxation,
+    set_model_schedule,
+    evaluate_ubc_model,
+    early_stop_metric_value,
 )
 
 # ------------------------------------------------------------
@@ -157,11 +159,12 @@ def ubc_param_counts(
 ) -> Tuple[int, int]:
     pair_cfg = dict(pair_cfg or {})
     pair_cfg["route"] = "learned"
-    model = DepthStack(
-        B=B, L=L_used, S=S, tau=tau0,
-        pair=pair_cfg, gate_set=gate_set,
-        use_lifting=use_lifting, lift_factor=lift_factor,
-    )
+    with torch.random.fork_rng(devices=[]):
+        model = DepthStack(
+            B=B, L=L_used, S=S, tau=tau0,
+            pair=pair_cfg, gate_set=gate_set,
+            use_lifting=use_lifting, lift_factor=lift_factor,
+        )
     n_soft = count_trainable_params(model)
     K = 16 if gate_set == "16" else 6
     n_fixed = (L_used * S) * K
@@ -647,6 +650,8 @@ class UBCOut:
     taus: List[float]
     pred_expr: str
     gate_usage: Dict[str, Any]
+    diagnostics: Dict[str, Any]
+    train_steps: int
 
 def train_ubc_instance(device: torch.device, cfg: Dict[str, Any], inst: Dict[str, Any],
                        *, S_used: int, L_used: int) -> UBCOut:
@@ -673,6 +678,7 @@ def train_ubc_instance(device: torch.device, cfg: Dict[str, Any], inst: Dict[str
         pair=pair_cfg, gate_set=gate_set,
         use_lifting=use_lifting, lift_factor=lift_factor,
     ).to(device)
+    configure_model_relaxation(model, cfg)
 
     opt_name = str(cfg["optimizer"]).lower()
     opt = (optim.RMSprop(model.parameters(), lr=cfg["lr"], alpha=0.99, eps=1e-8)
@@ -691,27 +697,18 @@ def train_ubc_instance(device: torch.device, cfg: Dict[str, Any], inst: Dict[str
     target = float(es_cfg.get("target", 1.0))
     ok_streak = 0
 
-    last = None
+    if gate_set == "16":
+        from .boolean_prims16 import PRIMS16 as PRIMS
+    else:
+        from .boolean_prims import PRIMS as PRIMS
+
+    last_step = 0
     for step in range(steps):
-        taus = make_async_taus(
-            L=len(model.layers), step=step, total=steps,
-            T0=anneal_cfg["T0"], Tmin=anneal_cfg["Tmin"],
-            direction=anneal_cfg["direction"],
-            schedule=anneal_cfg.get("schedule", "linear"),
-            phase_scale=anneal_cfg.get("phase_scale", 0.4),
-            start_frac=anneal_cfg.get("start_frac", 0.0),
-        )
-        if hasattr(model, "set_layer_taus_and_bandwidths") and gate_set == "16":
-            s_cfg = cfg.get("sigma16", {})
-            s_start = float(s_cfg.get("s_start", 0.25))
-            s_end   = float(s_cfg.get("s_end", 0.10))
-            model.set_layer_taus_and_bandwidths(taus, s_start=s_start, s_end=s_end)
-        else:
-            model.set_layer_taus(taus)
+        last_step = step
+        taus = set_model_schedule(model, cfg, gate_set, step=step, total=steps)
 
         opt.zero_grad()
         y_pred, dbg = model(X)
-        last = (y_pred, dbg, taus)
 
         loss = safe_bce(y_pred, y_true)
         dbg_slim = [(d[0], d[1], d[2]) for d in dbg]
@@ -726,37 +723,43 @@ def train_ubc_instance(device: torch.device, cfg: Dict[str, Any], inst: Dict[str
         opt.step()
 
         if use_es and (step + 1) >= min_steps and ((step + 1) % check_every == 0):
-            with torch.no_grad():
-                row_acc, em = per_instance_metrics(y_true, y_pred)
-                cur = float(em) if metric == "em" else float(row_acc)
-                ok_streak = (ok_streak + 1) if (cur >= target) else 0
-                if ok_streak >= patience_checks:
-                    break
+            eval_now = evaluate_ubc_model(
+                model, cfg, B=B, X=X, y_true=y_true, gate_set=gate_set,
+                PRIMS=PRIMS, step=step, total=steps,
+            )
+            cur = early_stop_metric_value(
+                metric,
+                row_acc=eval_now["row_acc"],
+                em=eval_now["em"],
+                decoded_row_acc=eval_now["decoded_row_acc"],
+                decoded_em=eval_now["decoded_em"],
+            )
+            ok_streak = (ok_streak + 1) if (cur >= target) else 0
+            if ok_streak >= patience_checks:
+                break
 
-    y_pred, dbg, final_taus = last
-    with torch.no_grad():
-        row_acc, em = per_instance_metrics(y_true, y_pred)
-
-        if gate_set == "16":
-            from .boolean_prims16 import PRIMS16 as PRIMS
-        else:
-            from .boolean_prims import PRIMS as PRIMS
-
-        lift_W = model.lift.W.detach() if getattr(model, "lift", None) is not None else None
-        pred_expr_raw = compose_readout_expr(B, dbg, final_taus, PRIMS, lift_W=lift_W)
-        pred_expr = normalize_readout_expr(pred_expr_raw)
-        decoded_row_acc, decoded_em = decoded_readout_metrics(B, pred_expr_raw, y_true)
-        gate_usage = extract_gate_usage_from_dbg(dbg, final_taus, PRIMS)
+    final_eval = evaluate_ubc_model(
+        model, cfg, B=B, X=X, y_true=y_true, gate_set=gate_set,
+        PRIMS=PRIMS, step=last_step, total=steps,
+    )
+    row_acc = final_eval["row_acc"]
+    em = final_eval["em"]
+    decoded_row_acc = final_eval["decoded_row_acc"]
+    decoded_em = final_eval["decoded_em"]
+    pred_expr = normalize_readout_expr(final_eval["pred_expr"])
+    gate_usage = extract_gate_usage_from_dbg(final_eval["dbg"], final_eval["taus"], PRIMS)
 
     return UBCOut(
         row_acc=row_acc,
         em=em,
         decoded_row_acc=decoded_row_acc,
         decoded_em=decoded_em,
-        dbg=dbg,
-        taus=final_taus,
+        dbg=final_eval["dbg"],
+        taus=final_eval["taus"],
         pred_expr=pred_expr,
         gate_usage=gate_usage,
+        diagnostics=final_eval["diagnostics"],
+        train_steps=int(last_step + 1),
     )
 
 
@@ -827,7 +830,7 @@ def train_mlp_instance(device: torch.device, cfg: Dict[str, Any], inst: Dict[str
         if use_es and (step + 1) >= min_steps and ((step + 1) % check_every == 0):
             with torch.no_grad():
                 row_acc, em = per_instance_metrics(y_true, y_pred)
-                cur = float(em) if metric == "em" else float(row_acc)
+                cur = float(em) if metric in {"em", "soft_em", "decoded_em", "hard_em", "both_em"} else float(row_acc)
                 ok_streak = (ok_streak + 1) if (cur >= target) else 0
                 if ok_streak >= patience_checks:
                     break
@@ -887,6 +890,7 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
 
     expr_rows = []
     agg = defaultdict(list)
+    base_seed = int(cfg.get("seed", 0))
 
     for idx, inst in enumerate(insts):
         B = int(inst["B"])
@@ -911,7 +915,11 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
             tau0=tau0, use_lifting=use_lifting, lift_factor=lift_factor,
         )
 
+        ubc_seed = stable_seed(base_seed, "joint-ubc", idx)
+        mlp_seed = stable_seed(base_seed, "joint-mlp", args.mlp_match, idx)
+        seed_all(ubc_seed)
         ubc = train_ubc_instance(device, cfg, inst, S_used=S_used, L_used=L_used)
+        seed_all(mlp_seed)
         mlp = train_mlp_instance(
             device, cfg, inst, S_used=S_used, L_used=L_used,
             match_mode=args.mlp_match,
@@ -947,6 +955,9 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
                 "gate_usage": ubc.gate_usage,
                 "n_soft_params": ubc_soft,
                 "n_total_params": ubc_total,
+                "diagnostics": ubc.diagnostics,
+                "train_steps": ubc.train_steps,
+                "seed": ubc_seed,
             },
             "mlp": {
                 "match_mode": args.mlp_match,
@@ -963,6 +974,7 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
                 "mlp_expr": mlp.mlp_expr,
                 "mlp_expr_fit_acc": mlp.mlp_expr_fit_acc,
                 "layer_stats": mlp.layer_stats,
+                "seed": mlp_seed,
             },
             "expr_lengths": {
                 "label": {"char": lab_char, "tok": lab_tok},
@@ -994,6 +1006,7 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
             "prim_best_acc_L1": mlp.mean_best_primitive_acc_L1,
 
             "mlp_expr_fit_acc": mlp.mlp_expr_fit_acc,
+            "ubc_train_steps": ubc.train_steps,
 
             "label_tok": lab_tok, "label_char": lab_char,
             "ubc_tok": ubc_tok, "ubc_char": ubc_char,
@@ -1012,6 +1025,7 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
         agg["ubc_row_acc"].append(float(ubc.row_acc))
         agg["ubc_decoded_row_acc"].append(float(ubc.decoded_row_acc))
         agg["mlp_row_acc"].append(float(mlp.row_acc))
+        agg["ubc_train_steps"].append(float(ubc.train_steps))
 
         agg["mlp_params"].append(float(mlp.n_params))
         agg["ubc_soft_params"].append(float(ubc_soft))
@@ -1022,6 +1036,9 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
         agg["bnr_eps_L1"].append(float(bnr_eps_L1))
         agg["prim_hit_L1"].append(float(mlp.primitive_hit_rate_L1))
         agg["prim_best_acc_L1"].append(float(mlp.mean_best_primitive_acc_L1))
+        for k, v in ubc.diagnostics.items():
+            if isinstance(v, (int, float)) and math.isfinite(float(v)):
+                agg[f"diag_{k}"].append(float(v))
 
         print(
             f"[{idx+1}/{len(insts)}] B={B} S={S_used} L={L_used} | "
@@ -1045,7 +1062,7 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
             "idx","B","S_used","L_used",
             "ubc_em","ubc_decoded_em","mlp_em",
             "bnr_exact_L1","bnr_eps_L1","prim_hit_L1","prim_best_acc_L1",
-            "mlp_expr_fit_acc",
+            "mlp_expr_fit_acc","ubc_train_steps",
             "label_tok","label_char","ubc_tok","ubc_char","mlp_tok","mlp_char","shortest",
             "label_expr","ubc_expr","mlp_expr"
         ]
@@ -1057,6 +1074,7 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
                 f"{r['bnr_exact_L1']:.6f}", f"{r['bnr_eps_L1']:.6f}",
                 f"{r['prim_hit_L1']:.6f}", f"{r['prim_best_acc_L1']:.6f}",
                 f"{r['mlp_expr_fit_acc']:.6f}",
+                str(r["ubc_train_steps"]),
                 str(r["label_tok"]), str(r["label_char"]),
                 str(r["ubc_tok"]), str(r["ubc_char"]),
                 str(r["mlp_tok"]), str(r["mlp_char"]),
@@ -1079,6 +1097,7 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
             "ubc_row_acc": float(sum(agg["ubc_row_acc"]) / n),
             "ubc_decoded_row_acc": float(sum(agg["ubc_decoded_row_acc"]) / n),
             "mlp_row_acc": float(sum(agg["mlp_row_acc"]) / n),
+            "ubc_train_steps": float(sum(agg["ubc_train_steps"]) / n),
             "mlp_params": float(sum(agg["mlp_params"]) / n),
             "ubc_soft_params": float(sum(agg["ubc_soft_params"]) / n),
             "ubc_total_params": float(sum(agg["ubc_total_params"]) / n),
@@ -1087,6 +1106,11 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
             "bnr_eps_L1": float(sum(agg["bnr_eps_L1"]) / n),
             "prim_hit_L1": float(sum(agg["prim_hit_L1"]) / n),
             "prim_best_acc_L1": float(sum(agg["prim_best_acc_L1"]) / n),
+            **{
+                k: float(sum(v) / max(1, len(v)))
+                for k, v in agg.items()
+                if k.startswith("diag_") and len(v) > 0
+            },
         },
         "n_instances": len(insts),
         "results_jsonl": str(results_jsonl),

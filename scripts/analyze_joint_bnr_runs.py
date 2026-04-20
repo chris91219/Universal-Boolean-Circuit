@@ -240,6 +240,13 @@ def main():
                     pass
 
         n_inst = len(ubc_em)
+        summary_means = summ.get("means", {}) if isinstance(summ.get("means", {}), dict) else {}
+        diag_summary = {
+            k: float(v)
+            for k, v in summary_means.items()
+            if (k == "ubc_train_steps" or str(k).startswith("diag_"))
+            and isinstance(v, (int, float))
+        }
 
         rows_runs.append({
             "run_dir": str(run_dir),
@@ -284,6 +291,7 @@ def main():
             "mean_label_tok": safe_mean(label_tok),
             "mean_ubc_tok": safe_mean(ubc_tok),
             "mean_mlp_tok": safe_mean(mlp_tok),
+            **diag_summary,
         })
 
         rows_overlap.append({
@@ -360,6 +368,11 @@ def main():
 
         avg_mlp_params_mean=("avg_mlp_params", "mean"),
     ).reset_index()
+
+    diag_cols = [c for c in df.columns if c == "ubc_train_steps" or str(c).startswith("diag_")]
+    if diag_cols:
+        dg = df.groupby("match_mode")[diag_cols].mean().reset_index()
+        g = g.merge(dg, on="match_mode", how="left")
 
     g.to_csv(out / "meta_groups.csv", index=False)
 

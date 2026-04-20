@@ -1,0 +1,222 @@
+Relaxation-to-Circuit Gap: Theory Notes for NeurIPS Resubmission
+=================================================================
+
+Purpose
+-------
+
+The current experiments reveal that the differentiable UBC relaxation can solve many truth tables while the locally argmax-decoded symbolic circuit can fail. This is not just an implementation detail; it is a mathematically meaningful gap between:
+
+1. the relaxed predictor evaluated by the soft forward pass; and
+2. the deterministic discrete circuit obtained by local argmax decoding of every routing/gate/readout categorical distribution.
+
+We should name and measure this gap explicitly, then connect it to theory and new rounding/hardening algorithms.
+
+
+1. A Measurable Relaxation-to-Circuit Gap
+-----------------------------------------
+
+For each benchmark instance f on the full Boolean cube X = {0,1}^B, let:
+
+soft(theta)(x)
+    be the differentiable UBC forward pass.
+
+hard(theta)(x)
+    be the circuit obtained by local argmax decoding of all categorical selectors/gates.
+
+Let y_f be the truth table of f. Define:
+
+SoftEM(theta, f) =
+    1{ threshold_0.5(soft(theta)(X)) = y_f }.
+
+DecodedEM(theta, f) =
+    1{ hard(theta)(X) = y_f }.
+
+RelaxationGap(theta, f) =
+    SoftEM(theta, f) - DecodedEM(theta, f).
+
+At the run level:
+
+RelaxationGapRate =
+    mean_f SoftEM(theta_f, f) - mean_f DecodedEM(theta_f, f).
+
+We can also use row-level versions:
+
+SoftRowAcc(theta, f) =
+    (1 / 2^B) sum_x 1{ threshold_0.5(soft(theta)(x)) = f(x) }.
+
+DecodedRowAcc(theta, f) =
+    (1 / 2^B) sum_x 1{ hard(theta)(x) = f(x) }.
+
+RowRelaxationGap =
+    SoftRowAcc - DecodedRowAcc.
+
+This makes "measurable" precise: it is directly observable from the same truth-table evaluation protocol. The current numbers suggest a large gap: high soft EM can coexist with low decoded EM.
+
+
+2. Why Local Argmax Can Fail
+----------------------------
+
+The UBC relaxation is a composition of categorical mixtures. Even when every local categorical has a high-probability option, the forward pass is not generally equal to the circuit obtained by independently taking local argmax choices.
+
+Three mechanisms can create the gap:
+
+1. Convex averaging of circuits.
+   The soft model can combine several partially correct subcircuits and become correct after thresholding, even when none of the locally decoded paths is globally correct.
+
+2. Local argmax is not MAP decoding.
+   Choosing the top option independently at each selector is not the same as choosing the globally best discrete circuit under truth-table loss. Correlations across layers matter.
+
+3. Early soft success can stop hardening.
+   If early stopping monitors only soft EM, optimization may stop before categorical margins are large enough to guarantee stable decoding.
+
+The experiments should therefore report both soft EM and decoded EM, plus entropy/margin diagnostics for all categorical choices.
+
+
+3. Rounding Theorem Target
+--------------------------
+
+Goal:
+    Prove a sufficient condition under which argmax decoding preserves correctness.
+
+Definitions:
+
+For each categorical distribution p over a gate/route/readout choice, define the categorical tail mass
+
+tail(p) = 1 - max_i p_i.
+
+Define the categorical margin
+
+margin(p) = p_(1) - p_(2),
+
+where p_(1) and p_(2) are the largest and second-largest entries.
+
+For a trained soft circuit theta, define the output margin on the truth table:
+
+gamma_out(theta, f) =
+    min_{x in X} | soft(theta)(x) - 1/2 |.
+
+Theorem Sketch A: Local Rounding Under Margins
+----------------------------------------------
+
+Let C_theta be a depth-Delta UBC soft circuit with bounded fan-in and bounded Lipschitz constants for each relaxed gate module on [0,1]^2. Let C_round be the circuit obtained by local argmax decoding.
+
+Assume:
+
+1. every gate/route/readout categorical distribution has tail mass at most epsilon_l at layer l;
+2. the accumulated perturbation bound satisfies
+
+       E_round <= Sum_{l=1}^Delta L_{l:Delta} epsilon_l < gamma_out(theta, f);
+
+3. threshold_0.5(C_theta(X)) = y_f on the full truth table.
+
+Then:
+
+       C_round(X) = y_f.
+
+Interpretation:
+
+If the soft model is correct with positive output margin, and all categorical distributions are sufficiently sharp, local argmax decoding preserves exact match.
+
+What this gives us:
+
+1. A clean theorem connecting optimization diagnostics to decoded EM.
+2. A reason to add margin/entropy regularization and a post-soft-success hardening phase.
+3. A falsifiable empirical prediction: decoded failures should concentrate at low categorical margin or low output margin.
+
+
+4. Existence/Rounding Theorem Target
+------------------------------------
+
+The local argmax theorem is sufficient but may be too strong. A softer and more general theorem is available if we interpret the trained UBC as a distribution over circuits.
+
+Let Pi_theta be the distribution over discrete circuits induced by sampling all categorical gate/route/readout choices. Let loss(C, f) be truth-table 0-1 row loss:
+
+loss(C, f) =
+    (1 / 2^B) sum_x 1{ C(x) != f(x) }.
+
+Theorem Sketch B: Low Expected Loss Implies a Good Discrete Circuit
+-------------------------------------------------------------------
+
+If
+
+    E_{C ~ Pi_theta} loss(C, f) <= epsilon,
+
+then there exists a discrete circuit C* in the support of Pi_theta such that
+
+    loss(C*, f) <= epsilon.
+
+Moreover, if we sample M independent circuits C_1,...,C_M from Pi_theta and score them on the full truth table, then
+
+    P[min_m loss(C_m, f) <= epsilon / delta] >= 1 - delta^M
+
+by Markov plus independence.
+
+Interpretation:
+
+Even when local argmax fails, the learned distribution may contain good discrete circuits. This motivates sampled decoding, beam search, or coordinate descent over discrete choices scored by truth-table loss.
+
+What this gives us:
+
+1. A theorem aligned with the original universality story, since the paper already models distributions over Boolean circuits.
+2. A principled alternative to naive local argmax.
+3. A direct empirical algorithm: sample or beam-decode circuits, score on the truth table, and report best decoded EM.
+
+
+5. Optimization/Learnability Direction
+--------------------------------------
+
+A possible learnability result can be stated under a realizability-plus-margin assumption.
+
+Assumptions:
+
+1. The target f is represented by some circuit C* in the UBC architecture with depth Delta and width Upsilon.
+2. The selector/gate logits have a neighborhood around C* in which C* remains the unique argmax with margin alpha.
+3. The soft forward pass has output margin gamma on the truth table in that neighborhood.
+4. The training objective includes BCE plus categorical entropy/margin regularization and an annealing schedule.
+
+Possible result:
+
+In the basin where all categorical margins exceed alpha/2 and output margin exceeds gamma/2, gradient steps that reduce the regularized loss preserve the decoded circuit and drive the soft predictor toward f. A final hardening phase increases categorical margins without changing the decoded function.
+
+This is more local than global learnability, but it is realistic and directly tied to the implementation.
+
+
+6. Experimental Plan Matching The Theory
+----------------------------------------
+
+The empirical section should include:
+
+1. Soft EM, decoded EM, row-level soft/decoded accuracy, and RelaxationGapRate.
+2. Categorical entropy and margin for gates, row selectors, and pair selectors.
+3. Output margin min/mean over the truth table.
+4. Early-stop step and whether early stopping triggered on decoded EM.
+5. Controlled ablation of S_add, lifting, Tmin, entropy strength, and relaxation mode.
+6. Local argmax vs sampled/beam/coordinate decoding.
+
+The key plot:
+
+    decoded EM versus categorical margin / output margin.
+
+If the rounding theorem is right, decoded failures should occur mostly when the theorem's sufficient margin condition is violated.
+
+
+7. Positioning
+--------------
+
+If universality remains the main theorem:
+
+The paper can say: the architecture is intrinsically circuit-valued at the sampled/discrete level and universally expressive; the differentiable training relaxation is effective but introduces a measurable relaxation-to-circuit gap. We then quantify and reduce this gap.
+
+If we add optimization theory:
+
+The paper can say: beyond universality, we provide sufficient margin conditions for faithful rounding and an existence theorem justifying sampled/beam decoding. This addresses the reviewers' learnability concern without overclaiming global optimization guarantees.
+
+Fallback story:
+
+Even if decoded EM does not exceed MLP EM, the contribution can still be strong if we show:
+
+1. high soft EM;
+2. low BNR / low primitive faithfulness for matched MLPs;
+3. a mathematically characterized relaxation-to-circuit gap;
+4. a rounding/search method that improves decoded EM;
+5. diagnostics that match the theorem's predicted failure modes.

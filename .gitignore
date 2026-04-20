@@ -10,6 +10,6 @@ build/
 *.err
 experiments/runs/
 experiments/results/
+.results/
 data/
 .notebooks_checkpoints/
-

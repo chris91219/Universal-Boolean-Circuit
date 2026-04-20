@@ -73,6 +73,7 @@ def _infer_variant_meta(run_dir: Path, summary: Dict[str, Any]) -> Tuple[
         "ablations_opt",
         "bench_pair_sweep",
         "bench_default_best_main",
+        "bench_default_gumbel_grid",
         "bench_default",
         "bench_default_g16",
         "mi_ablation",
@@ -168,6 +169,13 @@ def _extract_metrics(summary: Dict[str, Any], run_dir: Path) -> Dict[str, Any]:
         out["equiv_rate"] = float(summary.get("equiv_rate", float("nan")))
         results = summary.get("results", [])
         out["n_instances"] = int(len(results)) if isinstance(results, list) else None
+        out["avg_train_steps"] = _safe_nested_mean(results, ["train_steps"])
+
+        avg_diag = summary.get("avg_diagnostics", {})
+        if isinstance(avg_diag, dict):
+            for k, v in avg_diag.items():
+                if isinstance(v, (int, float)):
+                    out[f"diag_{k}"] = float(v)
 
         simpler = summary.get("simpler", {})
         counts = simpler.get("counts", {}) if isinstance(simpler, dict) else {}
@@ -194,10 +202,54 @@ def _extract_metrics(summary: Dict[str, Any], run_dir: Path) -> Dict[str, Any]:
         out["decoded_em_rate"] = float(decoded_em) if isinstance(decoded_em, (int, float)) else float("nan")
         out["avg_decoded_row_acc"] = float(summary.get("decoded_row_acc", float("nan")))
         out["equiv_rate"] = out["em_rate"]
+        out["avg_train_steps"] = float(summary.get("train_steps", float("nan")))
+        diag = summary.get("diagnostics", {})
+        if isinstance(diag, dict):
+            for k, v in diag.items():
+                if isinstance(v, (int, float)):
+                    out[f"diag_{k}"] = float(v)
         out["simpler_pred"] = out["simpler_label"] = out["simpler_tie"] = out["simpler_same"] = 0
         out["ratio_pred"] = out["ratio_label"] = out["ratio_tie"] = out["ratio_same"] = 0.0
 
     return out
+
+
+def _safe_nested_mean(items: Any, path: List[str]) -> float:
+    if not isinstance(items, list):
+        return float("nan")
+    vals = []
+    for item in items:
+        cur = item
+        for key in path:
+            if not isinstance(cur, dict) or key not in cur:
+                cur = None
+                break
+            cur = cur[key]
+        if isinstance(cur, (int, float)) and not math.isnan(float(cur)):
+            vals.append(float(cur))
+    return sum(vals) / len(vals) if vals else float("nan")
+
+
+def _extract_config_meta(summary: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = summary.get("config", {})
+    if not isinstance(cfg, dict):
+        cfg = {}
+    rel = cfg.get("relaxation", {}) if isinstance(cfg.get("relaxation", {}), dict) else {}
+    scale = cfg.get("scale", {}) if isinstance(cfg.get("scale", {}), dict) else {}
+    lifting = cfg.get("lifting", {}) if isinstance(cfg.get("lifting", {}), dict) else {}
+    early = cfg.get("early_stop", {}) if isinstance(cfg.get("early_stop", {}), dict) else {}
+    return {
+        "relax_mode": rel.get("mode", "softmax"),
+        "relax_hard": rel.get("hard", False),
+        "gumbel_tau": rel.get("gumbel_tau", ""),
+        "eval_hard": rel.get("eval_hard", False),
+        "S_op": scale.get("S_op", "identity"),
+        "S_k": scale.get("S_k", ""),
+        "L_op": scale.get("L_op", "identity"),
+        "L_k": scale.get("L_k", ""),
+        "lift_use": lifting.get("use", ""),
+        "early_stop_metric": early.get("metric", ""),
+    }
 
 
 def _mean_std(xs: List[float]) -> Tuple[float, float]:
@@ -209,20 +261,22 @@ def _mean_std(xs: List[float]) -> Tuple[float, float]:
     return m, math.sqrt(var)
 
 
-def _score_tuple(run: Dict[str, Any]) -> Tuple[float, float, float]:
+def _score_tuple(run: Dict[str, Any]) -> Tuple[float, float, float, float]:
     """
     Ranking key for 'best' selection:
-      1) higher em_rate
-      2) then higher avg_row_acc
-      3) then higher ratio_pred (share of cases where pred simpler than label)
+      1) higher decoded_em_rate
+      2) then higher avg_decoded_row_acc
+      3) then higher soft em_rate
     """
+    dem = run.get("decoded_em_rate")
+    dacc = run.get("avg_decoded_row_acc")
     em = run.get("em_rate")
     acc = run.get("avg_row_acc")
-    rpred = run.get("ratio_pred")
+    dem = float(dem) if isinstance(dem, (int, float)) else float("-inf")
+    dacc = float(dacc) if isinstance(dacc, (int, float)) else float("-inf")
     em = float(em) if isinstance(em, (int, float)) else float("-inf")
     acc = float(acc) if isinstance(acc, (int, float)) else float("-inf")
-    rpred = float(rpred) if isinstance(rpred, (int, float)) else float("-inf")
-    return (em, acc, rpred)
+    return (dem, dacc, em, acc)
 
 
 def main():
@@ -245,6 +299,7 @@ def main():
             folder_root = str(root)
             variant, mode, eta, seed, gate_set, repel, route, lam_const16 = _infer_variant_meta(run_dir, s)
             mets = _extract_metrics(s, run_dir)
+            cfg_meta = _extract_config_meta(s)
 
             row = {
                 "folder_root": folder_root,
@@ -255,6 +310,7 @@ def main():
                 "mode": mode,
                 "eta": eta,
                 "lam_const16": lam_const16,
+                **cfg_meta,
                 "seed": seed,
                 "run_dir": str(run_dir),
                 **mets,
@@ -269,11 +325,16 @@ def main():
 
     fieldnames_runs = [
         "folder_root", "variant", "gate_set", "route", "repel", "mode", "eta", "lam_const16",
+        "relax_mode", "relax_hard", "gumbel_tau", "eval_hard",
+        "S_op", "S_k", "L_op", "L_k", "lift_use", "early_stop_metric",
         "seed", "run_dir",
         "avg_row_acc", "em_rate", "avg_decoded_row_acc", "decoded_em_rate", "equiv_rate", "n_instances",
+        "avg_train_steps",
         "simpler_pred", "simpler_label", "simpler_tie", "simpler_same",
         "ratio_pred", "ratio_label", "ratio_tie", "ratio_same",
     ]
+    diag_fields = sorted({k for r in rows for k in r if k.startswith("diag_")})
+    fieldnames_runs.extend(diag_fields)
     with runs_csv.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames_runs)
         w.writeheader()
@@ -283,7 +344,7 @@ def main():
 
     # ---------- grouped CSV ----------
     grouped: Dict[
-        Tuple[str, str, Optional[str], Optional[str], Optional[bool], Optional[str], Optional[float], Optional[float]],
+        Tuple[Any, ...],
         List[Dict[str, Any]]
     ] = defaultdict(list)
     for r in rows:
@@ -296,24 +357,40 @@ def main():
             r.get("mode"),
             r.get("lam_const16"),
             r.get("eta"),
+            r.get("relax_mode"),
+            r.get("relax_hard"),
+            r.get("gumbel_tau"),
+            r.get("eval_hard"),
+            r.get("S_op"),
+            r.get("S_k"),
+            r.get("L_op"),
+            r.get("L_k"),
+            r.get("lift_use"),
+            r.get("early_stop_metric"),
         )
         grouped[key].append(r)
 
     group_rows: List[Dict[str, Any]] = []
     for key, items in grouped.items():
-        folder_root, variant, gate_set, route, repel, mode, lam_const16, eta = key
+        (
+            folder_root, variant, gate_set, route, repel, mode, lam_const16, eta,
+            relax_mode, relax_hard, gumbel_tau, eval_hard,
+            S_op, S_k, L_op, L_k, lift_use, early_stop_metric,
+        ) = key
         seeds = sorted(set(it.get("seed") for it in items if it.get("seed") is not None))
         ems = [it["em_rate"] for it in items]
         accs = [it["avg_row_acc"] for it in items]
         decoded_ems = [it["decoded_em_rate"] for it in items]
         decoded_accs = [it["avg_decoded_row_acc"] for it in items]
         eqvs = [it["equiv_rate"] for it in items]
+        train_steps = [it.get("avg_train_steps", float("nan")) for it in items]
 
         em_mean, em_std = _mean_std(ems)
         acc_mean, acc_std = _mean_std(accs)
         decoded_em_mean, decoded_em_std = _mean_std(decoded_ems)
         decoded_acc_mean, decoded_acc_std = _mean_std(decoded_accs)
         eqv_mean, eqv_std = _mean_std(eqvs)
+        train_steps_mean, _ = _mean_std(train_steps)
 
         # Sum counts across runs
         simpler_pred = sum(int(it.get("simpler_pred", 0)) for it in items)
@@ -331,6 +408,16 @@ def main():
             "mode": mode,
             "lam_const16": lam_const16,
             "eta": eta,
+            "relax_mode": relax_mode,
+            "relax_hard": relax_hard,
+            "gumbel_tau": gumbel_tau,
+            "eval_hard": eval_hard,
+            "S_op": S_op,
+            "S_k": S_k,
+            "L_op": L_op,
+            "L_k": L_k,
+            "lift_use": lift_use,
+            "early_stop_metric": early_stop_metric,
             "num_runs": len(items),
             "num_seeds": len(seeds),
             "seeds": ",".join(map(str, seeds)) if seeds else "",
@@ -344,26 +431,35 @@ def main():
             "avg_decoded_row_acc_std": decoded_acc_std,
             "equiv_rate_mean": eqv_mean,
             "equiv_rate_std": eqv_std,
+            "avg_train_steps_mean": train_steps_mean,
             "n_instances_total": n_instances_total,
             "simpler_pred_sum": simpler_pred,
             "simpler_label_sum": simpler_label,
             "simpler_tie_sum": simpler_tie,
             "simpler_same_sum": simpler_same,
         })
+        for diag_key in diag_fields:
+            m, s = _mean_std([it.get(diag_key, float("nan")) for it in items])
+            group_rows[-1][f"{diag_key}_mean"] = m
+            group_rows[-1][f"{diag_key}_std"] = s
 
     groups_csv = out_dir / "meta_groups.csv"
     with groups_csv.open("w", newline="") as f:
         fieldnames = [
             "folder_root", "variant", "gate_set", "route", "repel", "mode", "lam_const16", "eta",
+            "relax_mode", "relax_hard", "gumbel_tau", "eval_hard",
+            "S_op", "S_k", "L_op", "L_k", "lift_use", "early_stop_metric",
             "num_runs", "num_seeds", "seeds",
             "em_mean", "em_std",
             "avg_row_acc_mean", "avg_row_acc_std",
             "decoded_em_mean", "decoded_em_std",
             "avg_decoded_row_acc_mean", "avg_decoded_row_acc_std",
-            "equiv_rate_mean", "equiv_rate_std",
+            "equiv_rate_mean", "equiv_rate_std", "avg_train_steps_mean",
             "n_instances_total",
             "simpler_pred_sum", "simpler_label_sum", "simpler_tie_sum", "simpler_same_sum",
         ]
+        for diag_key in diag_fields:
+            fieldnames.extend([f"{diag_key}_mean", f"{diag_key}_std"])
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for r in sorted(
@@ -374,6 +470,16 @@ def main():
                 str(x.get("route") or ""),
                 str(x.get("repel") or ""),
                 str(x.get("mode") or ""),
+                str(x.get("relax_mode") or ""),
+                str(x.get("relax_hard") or ""),
+                str(x.get("gumbel_tau") or ""),
+                str(x.get("eval_hard") or ""),
+                str(x.get("S_op") or ""),
+                str(x.get("S_k") or ""),
+                str(x.get("L_op") or ""),
+                str(x.get("L_k") or ""),
+                str(x.get("lift_use") or ""),
+                str(x.get("early_stop_metric") or ""),
                 x.get("lam_const16") if x.get("lam_const16") is not None else -1.0,
                 x.get("eta") if x.get("eta") is not None else -1.0,
             ),
@@ -387,17 +493,31 @@ def main():
     best_overall_csv = out_dir / "best_overall.csv"
     with best_overall_csv.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=[
+            "variant", "relax_mode", "relax_hard", "gumbel_tau", "eval_hard",
+            "S_op", "S_k", "L_op", "L_k", "lift_use", "early_stop_metric",
             "run_dir", "em_rate", "avg_row_acc",
             "decoded_em_rate", "avg_decoded_row_acc",
-            "ratio_pred",
+            "avg_train_steps", "ratio_pred",
         ])
         w.writeheader()
         w.writerow({
+            "variant": best_overall.get("variant", ""),
+            "relax_mode": best_overall.get("relax_mode", ""),
+            "relax_hard": best_overall.get("relax_hard", ""),
+            "gumbel_tau": best_overall.get("gumbel_tau", ""),
+            "eval_hard": best_overall.get("eval_hard", ""),
+            "S_op": best_overall.get("S_op", ""),
+            "S_k": best_overall.get("S_k", ""),
+            "L_op": best_overall.get("L_op", ""),
+            "L_k": best_overall.get("L_k", ""),
+            "lift_use": best_overall.get("lift_use", ""),
+            "early_stop_metric": best_overall.get("early_stop_metric", ""),
             "run_dir": best_overall.get("run_dir", ""),
             "em_rate": best_overall.get("em_rate", ""),
             "avg_row_acc": best_overall.get("avg_row_acc", ""),
             "decoded_em_rate": best_overall.get("decoded_em_rate", ""),
             "avg_decoded_row_acc": best_overall.get("avg_decoded_row_acc", ""),
+            "avg_train_steps": best_overall.get("avg_train_steps", ""),
             "ratio_pred": best_overall.get("ratio_pred", ""),
         })
     print(f"[ok] Wrote best overall: {best_overall_csv}")
@@ -405,7 +525,7 @@ def main():
     # ---------- best by setup ----------
     # Group key defining a "setup"
     setup_groups: Dict[
-        Tuple[str, str, Optional[str], Optional[bool], Optional[str], Optional[float], Optional[float]],
+        Tuple[Any, ...],
         List[Dict[str, Any]]
     ] = defaultdict(list)
     for r in rows:
@@ -417,12 +537,26 @@ def main():
             r.get("mode"),
             r.get("lam_const16"),
             r.get("eta"),
+            r.get("relax_mode"),
+            r.get("relax_hard"),
+            r.get("gumbel_tau"),
+            r.get("eval_hard"),
+            r.get("S_op"),
+            r.get("S_k"),
+            r.get("L_op"),
+            r.get("L_k"),
+            r.get("lift_use"),
+            r.get("early_stop_metric"),
         )
         setup_groups[setup_key].append(r)
 
     best_by_setup_rows: List[Dict[str, Any]] = []
     for key, items in setup_groups.items():
-        variant, gate_set, route, repel, mode, lam_const16, eta = key
+        (
+            variant, gate_set, route, repel, mode, lam_const16, eta,
+            relax_mode, relax_hard, gumbel_tau, eval_hard,
+            S_op, S_k, L_op, L_k, lift_use, early_stop_metric,
+        ) = key
         winner = max(items, key=_score_tuple)
         best_by_setup_rows.append({
             "variant": variant,
@@ -432,11 +566,22 @@ def main():
             "mode": mode,
             "lam_const16": lam_const16,
             "eta": eta,
+            "relax_mode": relax_mode,
+            "relax_hard": relax_hard,
+            "gumbel_tau": gumbel_tau,
+            "eval_hard": eval_hard,
+            "S_op": S_op,
+            "S_k": S_k,
+            "L_op": L_op,
+            "L_k": L_k,
+            "lift_use": lift_use,
+            "early_stop_metric": early_stop_metric,
             "run_dir": winner.get("run_dir", ""),
             "em_rate": winner.get("em_rate", ""),
             "avg_row_acc": winner.get("avg_row_acc", ""),
             "decoded_em_rate": winner.get("decoded_em_rate", ""),
             "avg_decoded_row_acc": winner.get("avg_decoded_row_acc", ""),
+            "avg_train_steps": winner.get("avg_train_steps", ""),
             "ratio_pred": winner.get("ratio_pred", ""),
         })
 
@@ -444,9 +589,11 @@ def main():
     with best_by_setup_csv.open("w", newline="") as f:
         fieldnames = [
             "variant", "gate_set", "route", "repel", "mode", "lam_const16", "eta",
+            "relax_mode", "relax_hard", "gumbel_tau", "eval_hard",
+            "S_op", "S_k", "L_op", "L_k", "lift_use", "early_stop_metric",
             "run_dir", "em_rate", "avg_row_acc",
             "decoded_em_rate", "avg_decoded_row_acc",
-            "ratio_pred",
+            "avg_train_steps", "ratio_pred",
         ]
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
@@ -456,6 +603,16 @@ def main():
                 x["variant"], str(x.get("gate_set") or ""),
                 str(x.get("route") or ""), str(x.get("repel") or ""),
                 str(x.get("mode") or ""),
+                str(x.get("relax_mode") or ""),
+                str(x.get("relax_hard") or ""),
+                str(x.get("gumbel_tau") or ""),
+                str(x.get("eval_hard") or ""),
+                str(x.get("S_op") or ""),
+                str(x.get("S_k") or ""),
+                str(x.get("L_op") or ""),
+                str(x.get("L_k") or ""),
+                str(x.get("lift_use") or ""),
+                str(x.get("early_stop_metric") or ""),
                 x.get("lam_const16") if x.get("lam_const16") is not None else -1.0,
                 x.get("eta") if x.get("eta") is not None else -1.0,
             ),

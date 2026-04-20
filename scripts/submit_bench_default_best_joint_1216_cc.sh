@@ -6,7 +6,7 @@
 
 #SBATCH --job-name=ubc_best_joint1216
 #SBATCH --account=def-ssanner
-#SBATCH --time=0-12:00:00
+#SBATCH --time=1-00:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --array=0-14
@@ -125,6 +125,11 @@ use_max_L: false
 lifting:
   use: ${LIFT_USE}
   factor: ${LIFT_FACTOR}
+relaxation:
+  mode: softmax
+  hard: false
+  gumbel_tau: 1.0
+  eval_hard: false
 anneal:
   T0: ${T0}
   Tmin: ${TMIN}
@@ -151,7 +156,7 @@ pair:
   eta: ${ETA}
 early_stop:
   use: true
-  metric: em
+  metric: decoded_em
   target: 1.0
   min_steps: 100
   check_every: 10

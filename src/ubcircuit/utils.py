@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 from typing import Iterable, List, Sequence
+import hashlib
 import math
 import random
 import torch
@@ -30,9 +31,56 @@ def seed_all(seed: int = 42) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+def stable_seed(base_seed: int, *parts: object) -> int:
+    """Derive a deterministic 31-bit child seed from a base seed and labels."""
+    h = hashlib.blake2b(digest_size=8)
+    h.update(str(int(base_seed)).encode("utf-8"))
+    for part in parts:
+        h.update(b"\0")
+        h.update(str(part).encode("utf-8"))
+    return int.from_bytes(h.digest(), "little") % (2**31 - 1)
+
 def safe_bce(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Binary cross-entropy with a small clamp to avoid log(0)."""
     return F.binary_cross_entropy(clamp01(pred), target)
+
+def categorical_relaxation(
+    scaled_logits: torch.Tensor,
+    *,
+    mode: str = "softmax",
+    hard: bool = False,
+    gumbel_tau: float = 1.0,
+    eval_hard: bool = False,
+) -> torch.Tensor:
+    """
+    Convert already-temperature-scaled logits to a simplex vector.
+
+    mode="softmax" preserves the original behavior.
+    mode="gumbel" uses straight-through/hard Gumbel-Softmax while gradients are enabled.
+    mode="argmax_ste" uses deterministic straight-through argmax while gradients are enabled.
+    eval_hard=True makes no-grad/eval forwards use deterministic one-hot argmax.
+    """
+    mode = str(mode or "softmax").lower()
+    p = F.softmax(scaled_logits, dim=-1)
+
+    if eval_hard and not torch.is_grad_enabled():
+        idx = p.argmax(dim=-1, keepdim=True)
+        return torch.zeros_like(p).scatter_(-1, idx, 1.0)
+
+    if mode == "softmax":
+        return p
+    if mode == "gumbel" and torch.is_grad_enabled():
+        return F.gumbel_softmax(
+            scaled_logits,
+            tau=max(float(gumbel_tau), 1e-8),
+            hard=bool(hard),
+            dim=-1,
+        )
+    if mode == "argmax_ste" and torch.is_grad_enabled():
+        idx = p.argmax(dim=-1, keepdim=True)
+        y_hard = torch.zeros_like(p).scatter_(-1, idx, 1.0)
+        return y_hard - p.detach() + p
+    return p
 
 
 # ---------------------------
