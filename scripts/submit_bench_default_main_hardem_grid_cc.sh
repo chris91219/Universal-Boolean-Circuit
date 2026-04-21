@@ -12,6 +12,11 @@
 #   DATASET_SAMPLE_N=200 DATASET_SAMPLE_SEED=20260420 DATASET_SAMPLE_STRATIFY=B
 #   RUN_ROOT=/scratch/$USER/UBC-Results/bench_default_main_hardem_grid200
 #   UBC_NUM_THREADS=1
+#
+# Optional missing-only controls:
+#   SKIP_IF_SAMPLE_DONE=1
+#   SKIP_ROOTS=/scratch/$USER/UBC-Results/bench_default_main_hardem_grid200_from_full:/scratch/$USER/UBC-Results/bench_default_main_hardem_grid200
+#   SKIP_MIN_ROWS=200
 
 #SBATCH --job-name=ubc_main_hardem_grid
 #SBATCH --account=def-ssanner
@@ -132,6 +137,58 @@ seed_idx=$((SLURM_ARRAY_TASK_ID / NCONFIG))
 SEED="${SEEDS[$seed_idx]}"
 read -r CFG_NAME GATE_SET OPT LR ROUTE REPEL REPEL_MODE ETA PRIOR_STRENGTH MI_DISJOINT LIFT_USE RELAX_MODE RELAX_HARD EVAL_HARD GUMBEL_TAU S_ADD L_ADD T0 TMIN SCHED PHASE LAM_ENT LAM_CONST16 STEPS <<< "${CONFIGS[$config_idx]}"
 
+RUN_ROOT="${RUN_ROOT:-${RESULTS_ROOT}/bench_default_main_hardem_grid}"
+SKIP_ROOTS="${SKIP_ROOTS:-${RESULTS_ROOT}/bench_default_main_hardem_grid200_from_full:${RUN_ROOT}}"
+SKIP_MIN_ROWS="${SKIP_MIN_ROWS:-${SKIP_SAMPLE_N:-${DATASET_SAMPLE_N:-200}}}"
+
+if [[ "${SKIP_IF_SAMPLE_DONE:-0}" == "1" || "${SKIP_IF_SAMPLE_DONE:-false}" == "true" ]]; then
+  if CFG_NAME="${CFG_NAME}" SEED="${SEED}" SKIP_ROOTS="${SKIP_ROOTS}" SKIP_MIN_ROWS="${SKIP_MIN_ROWS}" python - <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+cfg_name = os.environ["CFG_NAME"]
+seed = os.environ["SEED"]
+roots = [Path(p).expanduser() for p in os.environ.get("SKIP_ROOTS", "").split(":") if p]
+min_rows = int(os.environ.get("SKIP_MIN_ROWS", "200"))
+
+def summary_done(path: Path) -> bool:
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return False
+    results = data.get("results")
+    return isinstance(results, list) and len(results) >= min_rows
+
+def jsonl_done(path: Path) -> bool:
+    try:
+        with path.open("r") as f:
+            return sum(1 for line in f if line.strip()) >= min_rows
+    except Exception:
+        return False
+
+for root in roots:
+    run_base = root / cfg_name / f"seed{seed}"
+    if not run_base.exists():
+        continue
+    for p in run_base.rglob("summary.json"):
+        if summary_done(p):
+            print(f"[skip] found existing result with >= {min_rows} rows: {p}")
+            sys.exit(0)
+    for p in run_base.rglob("results.jsonl"):
+        if jsonl_done(p):
+            print(f"[skip] found existing result with >= {min_rows} rows: {p}")
+            sys.exit(0)
+
+print(f"[run] missing sampled result for {cfg_name} seed{seed} in {':'.join(map(str, roots))}")
+sys.exit(1)
+PY
+  then
+    exit 0
+  fi
+fi
+
 LAM_DIV_U=5.0e-4
 LAM_DIV_R=5.0e-4
 S16_START=0.25
@@ -221,7 +278,6 @@ early_stop:
 EOF
 
 STAMP="$(date +"%Y%m%d-%H%M%S")"
-RUN_ROOT="${RUN_ROOT:-${RESULTS_ROOT}/bench_default_main_hardem_grid}"
 RUN_DIR="${RUN_ROOT}/${CFG_NAME}/seed${SEED}/${STAMP}_job${SLURM_JOB_ID}_task${SLURM_ARRAY_TASK_ID}"
 mkdir -p "${RUN_DIR}"
 cp "${CFG}" "${RUN_DIR}/config.used.yaml"

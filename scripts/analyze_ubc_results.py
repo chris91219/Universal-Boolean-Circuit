@@ -140,6 +140,7 @@ def _infer_variant_meta(run_dir: Path, summary: Dict[str, Any]) -> Tuple[
         "bench_pair_sweep",
         "bench_default_best_main",
         "bench_default_main_hardem_grid200_from_full",
+        "bench_default_main_hardem_grid200_from_logs",
         "bench_default_main_hardem_grid200",
         "bench_default_main_hardem_grid",
         "bench_default_main_sadd_ladd_grid",
