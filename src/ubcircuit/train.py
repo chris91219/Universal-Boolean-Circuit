@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -113,6 +114,22 @@ def _device(cfg) -> torch.device:
     if cfg["device"] == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(cfg["device"])
+
+
+def configure_torch_threads_from_env() -> None:
+    """Let CC Slurms pin PyTorch threads for tiny per-instance trainings."""
+    raw = (
+        os.environ.get("UBC_TORCH_THREADS")
+        or os.environ.get("UBC_NUM_THREADS")
+        or os.environ.get("OMP_NUM_THREADS")
+    )
+    if raw:
+        try:
+            n = max(1, int(raw))
+            torch.set_num_threads(n)
+        except Exception:
+            pass
+    print(f"[info] torch_num_threads={torch.get_num_threads()}")
 
 
 # ---------- Metrics ----------
@@ -625,6 +642,8 @@ def train_single_instance(
 def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
     device = _device(cfg)
     seed_all(cfg["seed"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
 
     if str(cfg.get("gate_set", "6")) == "16":
         s16_cfg = cfg.get("sigma16", {})
@@ -642,22 +661,27 @@ def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
         print(f"[info] Using max L across dataset: L_max = {global_L}")
 
     results = []
-    for idx, inst in enumerate(insts):
-        seed_all(stable_seed(int(cfg["seed"]), "ubc", idx))
-        L_override = None
-        if l_strategy == "row" and ("L" in inst):
-            L_override = int(inst["L"])
-        elif l_strategy == "max":
-            L_override = int(global_L)
+    results_path = out_dir / "results.jsonl"
+    with results_path.open("w", buffering=1) as results_f:
+        for idx, inst in enumerate(insts):
+            seed_all(stable_seed(int(cfg["seed"]), "ubc", idx))
+            L_override = None
+            if l_strategy == "row" and ("L" in inst):
+                L_override = int(inst["L"])
+            elif l_strategy == "max":
+                L_override = int(global_L)
 
-        res = train_single_instance(device, cfg, inst, L_override=L_override)
-        results.append(res)
-        print(f"[{idx+1}/{len(insts)}] "
-              f"B={res['B']}  "
-              f"S:{res['S_base']}-> {res['S_used']}  "
-              f"L:{res['L_base']}-> {res['L_used']}  "
-              f"acc={res['row_acc']:.3f}  EM={res['em']}  "
-              f"decoded_acc={res['decoded_row_acc']:.3f}  decoded_EM={res['decoded_em']}")
+            res = train_single_instance(device, cfg, inst, L_override=L_override)
+            res_with_idx = {"idx": idx, **res}
+            results.append(res_with_idx)
+            results_f.write(json.dumps(res_with_idx) + "\n")
+            results_f.flush()
+            print(f"[{idx+1}/{len(insts)}] "
+                  f"B={res['B']}  "
+                  f"S:{res['S_base']}-> {res['S_used']}  "
+                  f"L:{res['L_base']}-> {res['L_used']}  "
+                  f"acc={res['row_acc']:.3f}  EM={res['em']}  "
+                  f"decoded_acc={res['decoded_row_acc']:.3f}  decoded_EM={res['decoded_em']}")
 
     n = max(1, len(results))
     avg_row_acc = sum(r["row_acc"] for r in results) / n
@@ -676,7 +700,6 @@ def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
         for k in diag_keys
     }
 
-    out_dir.mkdir(parents=True, exist_ok=True)
     summary = {
         "config": cfg,
         "l_strategy": l_strategy,
@@ -828,6 +851,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    configure_torch_threads_from_env()
     cfg = load_config(args.config)
     if args.dataset is not None:
         cfg["dataset"] = args.dataset

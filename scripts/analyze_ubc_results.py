@@ -9,7 +9,8 @@ Scans UBC-Results roots for run summary.json files and produces:
   - best_by_setup.csv        : best run per setup (same grouping key as meta_groups)
   - pair_sweep_pivot_em.csv  : (unchanged) eta x mode pivot of mean EM if both mode & eta exist
 
-No external deps (stdlib only).
+No required external deps. PyYAML is used opportunistically for partial runs
+that only have config.used.yaml.
 """
 from __future__ import annotations
 
@@ -22,6 +23,11 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
+try:
+    import yaml  # type: ignore
+except Exception:  # keep the analyzer usable in stdlib-only environments
+    yaml = None
+
 
 def _read_json(p: Path) -> Optional[Dict[str, Any]]:
     try:
@@ -30,6 +36,66 @@ def _read_json(p: Path) -> Optional[Dict[str, Any]]:
     except Exception as e:
         print(f"[warn] Could not read {p}: {e}")
         return None
+
+
+def _read_jsonl(p: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    try:
+        with p.open("r") as f:
+            for line in f:
+                if line.strip():
+                    rows.append(json.loads(line))
+    except Exception as e:
+        print(f"[warn] Could not read {p}: {e}")
+    return rows
+
+
+def _read_sidecar_config(run_dir: Path) -> Dict[str, Any]:
+    config_json = run_dir / "config.json"
+    if config_json.exists():
+        cfg = _read_json(config_json)
+        if isinstance(cfg, dict):
+            return cfg
+
+    config_yaml = run_dir / "config.used.yaml"
+    if yaml is not None and config_yaml.exists():
+        try:
+            loaded = yaml.safe_load(config_yaml.read_text()) or {}
+            if isinstance(loaded, dict):
+                return loaded
+        except Exception as e:
+            print(f"[warn] Could not read {config_yaml}: {e}")
+    return {}
+
+
+def _summary_from_results_jsonl(run_dir: Path) -> Optional[Dict[str, Any]]:
+    results = _read_jsonl(run_dir / "results.jsonl")
+    if not results:
+        return None
+
+    n = max(1, len(results))
+    diag_keys = sorted({
+        k
+        for r in results
+        for k, v in (r.get("diagnostics") or {}).items()
+        if isinstance(v, (int, float)) and math.isfinite(float(v))
+    })
+    avg_diagnostics = {
+        k: sum(float(r.get("diagnostics", {}).get(k, 0.0)) for r in results if k in r.get("diagnostics", {}))
+        / max(1, sum(1 for r in results if k in r.get("diagnostics", {})))
+        for k in diag_keys
+    }
+    return {
+        "config": _read_sidecar_config(run_dir),
+        "partial": True,
+        "completed": False,
+        "avg_row_acc": sum(float(r.get("row_acc", 0.0)) for r in results) / n,
+        "em_rate": sum(float(r.get("em", 0.0)) for r in results) / n,
+        "avg_decoded_row_acc": sum(float(r.get("decoded_row_acc", 0.0)) for r in results) / n,
+        "decoded_em_rate": sum(float(r.get("decoded_em", 0.0)) for r in results) / n,
+        "avg_diagnostics": avg_diagnostics,
+        "results": results,
+    }
 
 
 def _infer_variant_meta(run_dir: Path, summary: Dict[str, Any]) -> Tuple[
@@ -73,6 +139,8 @@ def _infer_variant_meta(run_dir: Path, summary: Dict[str, Any]) -> Tuple[
         "ablations_opt",
         "bench_pair_sweep",
         "bench_default_best_main",
+        "bench_default_main_hardem_grid200_from_full",
+        "bench_default_main_hardem_grid200",
         "bench_default_main_hardem_grid",
         "bench_default_main_sadd_ladd_grid",
         "bench_default_gumbel_grid",
@@ -162,6 +230,8 @@ def _extract_metrics(summary: Dict[str, Any], run_dir: Path) -> Dict[str, Any]:
     Support dataset (run_dataset) and single-task (run_single) summaries.
     """
     out: Dict[str, Any] = {}
+    out["partial"] = bool(summary.get("partial", False))
+    out["completed"] = bool(summary.get("completed", not out["partial"]))
     # dataset-style
     if "avg_row_acc" in summary:
         out["avg_row_acc"] = float(summary.get("avg_row_acc", float("nan")))
@@ -306,12 +376,44 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     rows: List[Dict[str, Any]] = []
+    seen_run_dirs = set()
     for root in roots:
         for p in root.rglob("summary.json"):
             s = _read_json(p)
             if not s:
                 continue
             run_dir = p.parent
+            seen_run_dirs.add(run_dir.resolve())
+            folder_root = str(root)
+            variant, mode, eta, seed, gate_set, repel, route, lam_const16 = _infer_variant_meta(run_dir, s)
+            mets = _extract_metrics(s, run_dir)
+            cfg_meta = _extract_config_meta(s)
+
+            row = {
+                "folder_root": folder_root,
+                "variant": variant,
+                "gate_set": gate_set,
+                "route": route,
+                "repel": repel,
+                "mode": mode,
+                "eta": eta,
+                "lam_const16": lam_const16,
+                **cfg_meta,
+                "seed": seed,
+                "run_dir": str(run_dir),
+                **mets,
+            }
+            rows.append(row)
+
+        # Timed-out jobs may only have the incremental results.jsonl. Treat
+        # those as partial runs so pilot grids are still analyzable.
+        for p in root.rglob("results.jsonl"):
+            run_dir = p.parent
+            if run_dir.resolve() in seen_run_dirs:
+                continue
+            s = _summary_from_results_jsonl(run_dir)
+            if not s:
+                continue
             folder_root = str(root)
             variant, mode, eta, seed, gate_set, repel, route, lam_const16 = _infer_variant_meta(run_dir, s)
             mets = _extract_metrics(s, run_dir)
@@ -336,7 +438,7 @@ def main():
     # ---------- per-run CSV ----------
     runs_csv = out_dir / "meta_runs.csv"
     if not rows:
-        print("[warn] No runs found (no summary.json under given roots).")
+        print("[warn] No runs found (no summary.json or results.jsonl under given roots).")
         return
 
     fieldnames_runs = [
@@ -347,7 +449,7 @@ def main():
         "lam_entropy", "lam_div_units", "lam_div_rows",
         "S_op", "S_k", "L_op", "L_k", "lift_use", "early_stop_metric",
         "prior_strength", "mi_disjoint",
-        "seed", "run_dir",
+        "seed", "run_dir", "partial", "completed",
         "avg_row_acc", "em_rate", "avg_decoded_row_acc", "decoded_em_rate", "equiv_rate", "n_instances",
         "avg_train_steps",
         "simpler_pred", "simpler_label", "simpler_tie", "simpler_same",
@@ -433,6 +535,8 @@ def main():
         simpler_tie = sum(int(it.get("simpler_tie", 0)) for it in items)
         simpler_same = sum(int(it.get("simpler_same", 0)) for it in items)
         n_instances_total = sum(int(it.get("n_instances", 0) or 0) for it in items)
+        partial_runs = sum(1 for it in items if it.get("partial"))
+        completed_runs = sum(1 for it in items if it.get("completed"))
 
         group_rows.append({
             "folder_root": folder_root,
@@ -465,6 +569,8 @@ def main():
             "mi_disjoint": mi_disjoint,
             "early_stop_metric": early_stop_metric,
             "num_runs": len(items),
+            "num_partial_runs": partial_runs,
+            "num_completed_runs": completed_runs,
             "num_seeds": len(seeds),
             "seeds": ",".join(map(str, seeds)) if seeds else "",
             "em_mean": em_mean,
@@ -499,7 +605,7 @@ def main():
             "lam_entropy", "lam_div_units", "lam_div_rows",
             "S_op", "S_k", "L_op", "L_k", "lift_use", "early_stop_metric",
             "prior_strength", "mi_disjoint",
-            "num_runs", "num_seeds", "seeds",
+            "num_runs", "num_partial_runs", "num_completed_runs", "num_seeds", "seeds",
             "em_mean", "em_std",
             "avg_row_acc_mean", "avg_row_acc_std",
             "decoded_em_mean", "decoded_em_std",
@@ -548,6 +654,24 @@ def main():
             w.writerow({k: r.get(k, "") for k in fieldnames})
     print(f"[ok] Wrote grouped: {groups_csv}")
 
+    ranked_groups_csv = out_dir / "meta_groups_ranked.csv"
+    with ranked_groups_csv.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in sorted(
+            group_rows,
+            key=lambda x: (
+                float(x.get("decoded_em_mean", float("nan"))),
+                float(x.get("avg_decoded_row_acc_mean", float("nan"))),
+                float(x.get("em_mean", float("nan"))),
+                float(x.get("avg_row_acc_mean", float("nan"))),
+                -float(x.get("avg_train_steps_mean", float("inf"))),
+            ),
+            reverse=True,
+        ):
+            w.writerow({k: r.get(k, "") for k in fieldnames})
+    print(f"[ok] Wrote ranked groups: {ranked_groups_csv}")
+
     # ---------- best overall ----------
     # Keep only per-run fields needed for ranking & reporting
     best_overall = max(rows, key=_score_tuple)
@@ -560,7 +684,7 @@ def main():
             "lam_entropy", "lam_div_units", "lam_div_rows",
             "S_op", "S_k", "L_op", "L_k", "lift_use", "early_stop_metric",
             "prior_strength", "mi_disjoint",
-            "run_dir", "em_rate", "avg_row_acc",
+            "run_dir", "partial", "completed", "n_instances", "em_rate", "avg_row_acc",
             "decoded_em_rate", "avg_decoded_row_acc",
             "avg_train_steps", "ratio_pred",
         ])
@@ -595,6 +719,9 @@ def main():
             "prior_strength": best_overall.get("prior_strength", ""),
             "mi_disjoint": best_overall.get("mi_disjoint", ""),
             "run_dir": best_overall.get("run_dir", ""),
+            "partial": best_overall.get("partial", ""),
+            "completed": best_overall.get("completed", ""),
+            "n_instances": best_overall.get("n_instances", ""),
             "em_rate": best_overall.get("em_rate", ""),
             "avg_row_acc": best_overall.get("avg_row_acc", ""),
             "decoded_em_rate": best_overall.get("decoded_em_rate", ""),
@@ -685,6 +812,9 @@ def main():
             "prior_strength": prior_strength,
             "mi_disjoint": mi_disjoint,
             "run_dir": winner.get("run_dir", ""),
+            "partial": winner.get("partial", ""),
+            "completed": winner.get("completed", ""),
+            "n_instances": winner.get("n_instances", ""),
             "em_rate": winner.get("em_rate", ""),
             "avg_row_acc": winner.get("avg_row_acc", ""),
             "decoded_em_rate": winner.get("decoded_em_rate", ""),
@@ -703,7 +833,7 @@ def main():
             "lam_entropy", "lam_div_units", "lam_div_rows",
             "S_op", "S_k", "L_op", "L_k", "lift_use", "early_stop_metric",
             "prior_strength", "mi_disjoint",
-            "run_dir", "em_rate", "avg_row_acc",
+            "run_dir", "partial", "completed", "n_instances", "em_rate", "avg_row_acc",
             "decoded_em_rate", "avg_decoded_row_acc",
             "avg_train_steps", "ratio_pred",
         ]

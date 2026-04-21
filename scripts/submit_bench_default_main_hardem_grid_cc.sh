@@ -7,6 +7,11 @@
 #
 # Submit from repo root:
 #   sbatch scripts/submit_bench_default_main_hardem_grid_cc.sh
+#
+# Optional pilot/sample controls, used by the grid200 wrapper:
+#   DATASET_SAMPLE_N=200 DATASET_SAMPLE_SEED=20260420 DATASET_SAMPLE_STRATIFY=B
+#   RUN_ROOT=/scratch/$USER/UBC-Results/bench_default_main_hardem_grid200
+#   UBC_NUM_THREADS=1
 
 #SBATCH --job-name=ubc_main_hardem_grid
 #SBATCH --account=def-ssanner
@@ -58,12 +63,18 @@ source "${PROJECT_DIR}/ENV/bin/activate"
 hash -r
 
 export PYTHONUNBUFFERED=1
-export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
-export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
+UBC_NUM_THREADS="${UBC_NUM_THREADS:-${SLURM_CPUS_PER_TASK}}"
+export UBC_NUM_THREADS
+export UBC_TORCH_THREADS="${UBC_TORCH_THREADS:-${UBC_NUM_THREADS}}"
+export OMP_NUM_THREADS="${UBC_NUM_THREADS}"
+export MKL_NUM_THREADS="${UBC_NUM_THREADS}"
+export OPENBLAS_NUM_THREADS="${UBC_NUM_THREADS}"
+export NUMEXPR_NUM_THREADS="${UBC_NUM_THREADS}"
+export VECLIB_MAXIMUM_THREADS="${UBC_NUM_THREADS}"
 export CUDA_VISIBLE_DEVICES=""
 export PYTHONPATH="${PROJECT_DIR}/src:${PYTHONPATH:-}"
 
-DATASET="${PROJECT_DIR}/data/bench_default.jsonl"
+FULL_DATASET="${DATASET:-${PROJECT_DIR}/data/bench_default.jsonl}"
 SEEDS=(1 2 3)
 
 # Fields:
@@ -131,6 +142,23 @@ LIFT_FACTOR=2.0
 
 TMPDIR_USE="${SLURM_TMPDIR:-/tmp}"
 mkdir -p "${TMPDIR_USE}"
+SAMPLE_META=""
+if [[ -n "${DATASET_SAMPLE_N:-}" ]]; then
+  DATASET_SAMPLE_SEED="${DATASET_SAMPLE_SEED:-20260420}"
+  DATASET_SAMPLE_STRATIFY="${DATASET_SAMPLE_STRATIFY:-B}"
+  DATASET="${TMPDIR_USE}/bench_default_sample${DATASET_SAMPLE_N}_seed${DATASET_SAMPLE_SEED}.jsonl"
+  SAMPLE_META="${TMPDIR_USE}/bench_default_sample${DATASET_SAMPLE_N}_seed${DATASET_SAMPLE_SEED}.meta.json"
+  python "${PROJECT_DIR}/scripts/make_bench_sample.py" \
+    --input "${FULL_DATASET}" \
+    --output "${DATASET}" \
+    --n "${DATASET_SAMPLE_N}" \
+    --seed "${DATASET_SAMPLE_SEED}" \
+    --stratify "${DATASET_SAMPLE_STRATIFY}" \
+    --meta "${SAMPLE_META}"
+else
+  DATASET="${FULL_DATASET}"
+fi
+
 CFG="${TMPDIR_USE}/cfg_main_hardem_${CFG_NAME}_seed${SEED}.yaml"
 
 cat > "${CFG}" <<EOF
@@ -193,16 +221,23 @@ early_stop:
 EOF
 
 STAMP="$(date +"%Y%m%d-%H%M%S")"
-RUN_DIR="${RESULTS_ROOT}/bench_default_main_hardem_grid/${CFG_NAME}/seed${SEED}/${STAMP}_job${SLURM_JOB_ID}_task${SLURM_ARRAY_TASK_ID}"
+RUN_ROOT="${RUN_ROOT:-${RESULTS_ROOT}/bench_default_main_hardem_grid}"
+RUN_DIR="${RUN_ROOT}/${CFG_NAME}/seed${SEED}/${STAMP}_job${SLURM_JOB_ID}_task${SLURM_ARRAY_TASK_ID}"
 mkdir -p "${RUN_DIR}"
 cp "${CFG}" "${RUN_DIR}/config.used.yaml"
+if [[ -n "${SAMPLE_META}" && -f "${SAMPLE_META}" ]]; then
+  cp "${SAMPLE_META}" "${RUN_DIR}/dataset.sample.meta.json"
+fi
 
 echo "[info] project=${PROJECT_DIR}"
 echo "[info] dataset=${DATASET}"
+echo "[info] full_dataset=${FULL_DATASET}"
+echo "[info] run_root=${RUN_ROOT}"
 echo "[info] config=${CFG_NAME} idx=${config_idx}/${NCONFIG}"
 echo "[info] seed=${SEED}"
 echo "[info] cfg=${CFG}"
 echo "[info] out=${RUN_DIR}"
+echo "[info] UBC_NUM_THREADS=${UBC_NUM_THREADS}"
 
 cd "${PROJECT_DIR}"
 
@@ -216,6 +251,7 @@ import torch
 import yaml
 import ubcircuit
 print("torch:", torch.__version__)
+print("torch num threads:", torch.get_num_threads())
 print("yaml:", getattr(yaml, "__version__", "unknown"))
 print("ubcircuit:", getattr(ubcircuit, "__file__", "unknown"))
 PY
