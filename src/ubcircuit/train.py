@@ -40,6 +40,30 @@ DEFAULT_CFG: Dict[str, Any] = {
         "gumbel_tau": 1.0,
         "eval_hard": False,      # deterministic one-hot during no-grad/eval forwards
     },
+    "jump": {
+        "use": False,
+        # Train with cfg["relaxation"] first, then switch to this hard mode at
+        # jump attempts. This is meant for soft-basin -> discrete-basin restarts.
+        "mode": "gumbel",        # "gumbel" | "argmax_ste"
+        "hard": True,
+        "gumbel_tau": 0.5,
+        "eval_hard": True,
+        "start_frac": 0.6,
+        "start_step": None,      # optional absolute override
+        "attempts": 0,
+        "interval": 0,           # 0 => spread attempts across remaining steps
+        "strength": 4.0,         # selected-vs-unselected gap in scaled-logit units
+        "noise_std": 0.10,       # noise in scaled-logit units after hardening
+        "sample": True,          # sample from soft distribution instead of argmax
+        "reset_optimizer": True,
+        "restore_anchor_each_attempt": True,
+        "keep_best": True,
+        "keep_best_metric": "decoded_row_acc",
+        "include_gates": True,
+        "include_rows": True,
+        "include_pairs": True,
+        "include_lift": True,
+    },
     "steps": 1200,
     "lr": 0.05,
     "optimizer": "rmsprop",
@@ -107,7 +131,7 @@ def load_config(path: str | None) -> Dict[str, Any]:
     if path:
         user = yaml.safe_load(open(path)) or {}
         for k, v in user.items():
-            if isinstance(v, dict) and k in {"anneal", "regs", "aux", "early_stop", "pair", "sigma16", "lifting", "scale", "relaxation"}:
+            if isinstance(v, dict) and k in {"anneal", "regs", "aux", "early_stop", "pair", "sigma16", "lifting", "scale", "relaxation", "jump"}:
                 cfg[k] = {**cfg[k], **v}
             else:
                 cfg[k] = v
@@ -152,13 +176,37 @@ def per_instance_metrics(y_true: torch.Tensor, y_pred: torch.Tensor) -> Tuple[fl
 
 def configure_model_relaxation(model: torch.nn.Module, cfg: Dict[str, Any]) -> None:
     rel = cfg.get("relaxation", {}) or {}
+    set_model_relaxation(
+        model,
+        mode=str(rel.get("mode", "softmax")),
+        hard=bool(rel.get("hard", False)),
+        gumbel_tau=float(rel.get("gumbel_tau", 1.0)),
+        eval_hard=bool(rel.get("eval_hard", False)),
+    )
+
+
+def set_model_relaxation(
+    model: torch.nn.Module,
+    *,
+    mode: str,
+    hard: bool,
+    gumbel_tau: float,
+    eval_hard: bool,
+) -> None:
     if hasattr(model, "set_relaxation"):
         model.set_relaxation(
-            mode=str(rel.get("mode", "softmax")),
-            hard=bool(rel.get("hard", False)),
-            gumbel_tau=float(rel.get("gumbel_tau", 1.0)),
-            eval_hard=bool(rel.get("eval_hard", False)),
+            mode=str(mode),
+            hard=bool(hard),
+            gumbel_tau=float(gumbel_tau),
+            eval_hard=bool(eval_hard),
         )
+
+
+def make_optimizer(model: torch.nn.Module, cfg: Dict[str, Any]) -> optim.Optimizer:
+    opt_name = str(cfg["optimizer"]).lower()
+    if opt_name == "rmsprop":
+        return optim.RMSprop(model.parameters(), lr=cfg["lr"], alpha=0.99, eps=1e-8)
+    return optim.Adam(model.parameters(), lr=cfg["lr"])
 
 
 def set_model_schedule(
@@ -185,6 +233,157 @@ def set_model_schedule(
     else:
         model.set_layer_taus(taus)
     return taus
+
+
+def _clone_state_dict(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    return {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+
+def _restore_state_dict(model: torch.nn.Module, state: Dict[str, torch.Tensor]) -> None:
+    model.load_state_dict(state, strict=True)
+
+
+def _sample_indices_from_probs(p: torch.Tensor, *, sample: bool) -> torch.Tensor:
+    flat = p.reshape(-1, p.shape[-1])
+    if sample:
+        idx = torch.multinomial(flat, num_samples=1).squeeze(-1)
+    else:
+        idx = flat.argmax(dim=-1)
+    return idx.reshape(p.shape[:-1])
+
+
+def _harden_logits_(
+    logits: torch.nn.Parameter,
+    *,
+    tau: float,
+    strength: float,
+    noise_std: float,
+    sample: bool,
+) -> int:
+    if logits.numel() == 0 or logits.dim() < 1 or logits.shape[-1] < 2:
+        return 0
+    tau = max(float(tau), 1e-8)
+    strength = max(float(strength), 0.0)
+    noise_std = max(float(noise_std), 0.0)
+    with torch.no_grad():
+        p = torch.softmax(logits.detach() / tau, dim=-1).clamp_min(1e-12)
+        idx = _sample_indices_from_probs(p, sample=sample)
+        new_logits = torch.full_like(logits, -0.5 * strength * tau)
+        new_logits.scatter_(-1, idx.unsqueeze(-1), 0.5 * strength * tau)
+        if noise_std > 0.0:
+            new_logits.add_(torch.randn_like(new_logits) * noise_std * tau)
+        logits.copy_(new_logits)
+    return int(p.reshape(-1, p.shape[-1]).shape[0])
+
+
+def apply_stochastic_jump(
+    model: torch.nn.Module,
+    cfg: Dict[str, Any],
+    *,
+    taus: List[float],
+) -> Dict[str, Any]:
+    """
+    Jump from a soft basin into a nearby discrete basin.
+
+    For each categorical parameter, sample (or argmax) according to its current
+    softened distribution, then rewrite logits so that the selected category has
+    a configured scaled-logit advantage. This is intentionally not beam search:
+    it is a stochastic basin restart around the learned relaxed solution.
+    """
+    jump_cfg = cfg.get("jump", {}) or {}
+    strength = float(jump_cfg.get("strength", 4.0))
+    noise_std = float(jump_cfg.get("noise_std", 0.10))
+    sample = bool(jump_cfg.get("sample", True))
+    include_gates = bool(jump_cfg.get("include_gates", True))
+    include_rows = bool(jump_cfg.get("include_rows", True))
+    include_pairs = bool(jump_cfg.get("include_pairs", True))
+    include_lift = bool(jump_cfg.get("include_lift", True))
+
+    counts = {"gate": 0, "row": 0, "pair": 0, "lift": 0}
+
+    if include_lift and getattr(model, "lift", None) is not None and hasattr(model.lift, "W"):
+        counts["lift"] += _harden_logits_(
+            model.lift.W,
+            tau=1.0,
+            strength=strength,
+            noise_std=noise_std,
+            sample=sample,
+        )
+
+    layers = list(getattr(model, "layers", []))
+    for li, layer in enumerate(layers):
+        tau = float(taus[li]) if li < len(taus) else 1.0
+        if include_rows and hasattr(layer, "WL"):
+            counts["row"] += _harden_logits_(
+                layer.WL,
+                tau=tau,
+                strength=strength,
+                noise_std=noise_std,
+                sample=sample,
+            )
+        if include_gates and hasattr(layer, "units"):
+            for unit in layer.units:
+                if hasattr(unit, "W"):
+                    counts["gate"] += _harden_logits_(
+                        unit.W,
+                        tau=tau,
+                        strength=strength,
+                        noise_std=noise_std,
+                        sample=sample,
+                    )
+        selector = getattr(layer, "selector", None)
+        if include_pairs and selector is not None:
+            if hasattr(selector, "PL"):
+                counts["pair"] += _harden_logits_(
+                    selector.PL,
+                    tau=tau,
+                    strength=strength,
+                    noise_std=noise_std,
+                    sample=sample,
+                )
+            if hasattr(selector, "PR"):
+                counts["pair"] += _harden_logits_(
+                    selector.PR,
+                    tau=tau,
+                    strength=strength,
+                    noise_std=noise_std,
+                    sample=sample,
+                )
+
+    return {
+        "strength": strength,
+        "noise_std": noise_std,
+        "sample": sample,
+        "counts": counts,
+    }
+
+
+def compute_jump_steps(cfg: Dict[str, Any], steps: int) -> List[int]:
+    jump_cfg = cfg.get("jump", {}) or {}
+    if not bool(jump_cfg.get("use", False)):
+        return []
+    attempts = int(jump_cfg.get("attempts", 0))
+    if attempts <= 0:
+        return []
+
+    start_raw = jump_cfg.get("start_step", None)
+    if start_raw is None:
+        start = int(round(float(steps) * float(jump_cfg.get("start_frac", 0.6))))
+    else:
+        start = int(start_raw)
+    start = max(0, min(max(0, steps - 1), start))
+
+    interval = int(jump_cfg.get("interval", 0) or 0)
+    if interval <= 0:
+        remaining = max(1, steps - start)
+        interval = max(1, remaining // max(1, attempts))
+
+    out = []
+    for i in range(attempts):
+        s = start + i * interval
+        if s < steps:
+            out.append(int(s))
+    return out
 
 
 def decode_from_dbg(
@@ -580,15 +779,20 @@ def train_single_instance(
     ).to(device)
     configure_model_relaxation(model, cfg)
 
-    opt_name = str(cfg["optimizer"]).lower()
-    opt = (
-        optim.RMSprop(model.parameters(), lr=cfg["lr"], alpha=0.99, eps=1e-8)
-        if opt_name == "rmsprop"
-        else optim.Adam(model.parameters(), lr=cfg["lr"])
-    )
+    opt = make_optimizer(model, cfg)
 
     steps = int(cfg["steps"])
     regs_cfg = cfg["regs"]
+    jump_cfg = cfg.get("jump", {}) or {}
+    jump_steps = set(compute_jump_steps(cfg, steps))
+    jump_anchor_state: Optional[Dict[str, torch.Tensor]] = None
+    jump_events: List[Dict[str, Any]] = []
+    jump_phase_active = False
+    jump_keep_best = bool(jump_cfg.get("keep_best", True)) and bool(jump_cfg.get("use", False))
+    jump_keep_metric = str(jump_cfg.get("keep_best_metric", "decoded_row_acc"))
+    best_jump_state: Optional[Dict[str, torch.Tensor]] = None
+    best_jump_step = 0
+    best_jump_value = float("-inf")
 
     es_cfg = cfg.get("early_stop", {})
     use_es = bool(es_cfg.get("use", False))
@@ -603,6 +807,68 @@ def train_single_instance(
     for step in range(steps):
         last_step = step
         taus = set_model_schedule(model, cfg, gate_set, step=step, total=steps)
+
+        if step in jump_steps:
+            eval_before_jump = evaluate_ubc_model(
+                model, cfg, B=B, X=X, y_true=y_true, gate_set=gate_set,
+                PRIMS=PRIMS_LIST, step=step, total=steps,
+            )
+            cur_val = early_stop_metric_value(
+                metric,
+                row_acc=eval_before_jump["row_acc"],
+                em=eval_before_jump["em"],
+                decoded_row_acc=eval_before_jump["decoded_row_acc"],
+                decoded_em=eval_before_jump["decoded_em"],
+            )
+            if cur_val >= target:
+                jump_events.append({
+                    "step": int(step),
+                    "skipped": True,
+                    "reason": f"{metric}>={target}",
+                    "pre_em": int(eval_before_jump["em"]),
+                    "pre_decoded_em": int(eval_before_jump["decoded_em"]),
+                    "pre_row_acc": float(eval_before_jump["row_acc"]),
+                    "pre_decoded_row_acc": float(eval_before_jump["decoded_row_acc"]),
+                })
+            else:
+                if jump_anchor_state is None:
+                    jump_anchor_state = _clone_state_dict(model)
+                elif bool(jump_cfg.get("restore_anchor_each_attempt", True)):
+                    _restore_state_dict(model, jump_anchor_state)
+                    taus = set_model_schedule(model, cfg, gate_set, step=step, total=steps)
+
+                jump_stats = apply_stochastic_jump(model, cfg, taus=taus)
+                set_model_relaxation(
+                    model,
+                    mode=str(jump_cfg.get("mode", "gumbel")),
+                    hard=bool(jump_cfg.get("hard", True)),
+                    gumbel_tau=float(jump_cfg.get("gumbel_tau", 0.5)),
+                    eval_hard=bool(jump_cfg.get("eval_hard", True)),
+                )
+                if bool(jump_cfg.get("reset_optimizer", True)):
+                    opt = make_optimizer(model, cfg)
+                ok_streak = 0
+                jump_phase_active = True
+                jump_events.append({
+                    "step": int(step),
+                    "skipped": False,
+                    "mode": str(jump_cfg.get("mode", "gumbel")),
+                    "hard": bool(jump_cfg.get("hard", True)),
+                    "gumbel_tau": float(jump_cfg.get("gumbel_tau", 0.5)),
+                    "eval_hard": bool(jump_cfg.get("eval_hard", True)),
+                    "pre_em": int(eval_before_jump["em"]),
+                    "pre_decoded_em": int(eval_before_jump["decoded_em"]),
+                    "pre_row_acc": float(eval_before_jump["row_acc"]),
+                    "pre_decoded_row_acc": float(eval_before_jump["decoded_row_acc"]),
+                    **jump_stats,
+                })
+                print(
+                    "  [jump] "
+                    f"step={step+1}, mode={jump_cfg.get('mode', 'gumbel')}, "
+                    f"pre_decoded_acc={eval_before_jump['decoded_row_acc']:.3f}, "
+                    f"pre_decoded_EM={eval_before_jump['decoded_em']}, "
+                    f"counts={jump_stats['counts']}"
+                )
 
         opt.zero_grad()
         y_pred, dbg = model(X)
@@ -631,10 +897,38 @@ def train_single_instance(
                 decoded_row_acc=eval_now["decoded_row_acc"],
                 decoded_em=eval_now["decoded_em"],
             )
+            if jump_keep_best and jump_phase_active:
+                keep_val = early_stop_metric_value(
+                    jump_keep_metric,
+                    row_acc=eval_now["row_acc"],
+                    em=eval_now["em"],
+                    decoded_row_acc=eval_now["decoded_row_acc"],
+                    decoded_em=eval_now["decoded_em"],
+                )
+                if keep_val > best_jump_value:
+                    best_jump_value = float(keep_val)
+                    best_jump_step = int(step)
+                    best_jump_state = _clone_state_dict(model)
             ok_streak = (ok_streak + 1) if (cur_val >= target) else 0
             if ok_streak >= patience_checks:
                 print(f"  [early-stop] step={step+1}, metric={metric}={cur_val:.3f} (target={target})")
                 break
+
+    if jump_keep_best and best_jump_state is not None:
+        cur_eval = evaluate_ubc_model(
+            model, cfg, B=B, X=X, y_true=y_true, gate_set=gate_set,
+            PRIMS=PRIMS_LIST, step=last_step, total=steps,
+        )
+        cur_keep = early_stop_metric_value(
+            jump_keep_metric,
+            row_acc=cur_eval["row_acc"],
+            em=cur_eval["em"],
+            decoded_row_acc=cur_eval["decoded_row_acc"],
+            decoded_em=cur_eval["decoded_em"],
+        )
+        if best_jump_value >= cur_keep:
+            _restore_state_dict(model, best_jump_state)
+            last_step = best_jump_step
 
     final_eval = evaluate_ubc_model(
         model, cfg, B=B, X=X, y_true=y_true, gate_set=gate_set,
@@ -664,6 +958,10 @@ def train_single_instance(
         "pred_expr": pred_expr,
         "gate_usage": gate_usage,
         "diagnostics": diagnostics,
+        "jump_events": jump_events,
+        "jump_best_metric": jump_keep_metric if jump_keep_best else None,
+        "jump_best_value": best_jump_value if best_jump_state is not None else None,
+        "jump_best_step": int(best_jump_step) if best_jump_state is not None else None,
         "train_steps": int(last_step + 1),
     }
 

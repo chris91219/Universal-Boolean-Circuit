@@ -1,24 +1,31 @@
 #!/bin/bash
-# SBC-only robustness grid on Compute Canada.
+# SBC robustness jump/restart sweep on Compute Canada.
+#
+# This is orthogonal to submit_robustness_sbc_cc.sh: it trains softly first,
+# then performs stochastic hard restarts from the learned soft basin using either
+# Gumbel-ST or deterministic argmax-STE.
 #
 # Grid:
 #   datasets: bench_small_b10_2000_noise_true_add{0,2,4,6,8,10}
 #   shape bases: W/D_base and W/D_true
-#   W_add/S_add: 2,4,6,8,10 with D_add/L_add=0
-#
-# The default suite measures noise relative to B_true.  The generated formula is
-# preserved up to compact variable renumbering, while ambient B is set from the
-# semantic variable count plus the requested noise budget whenever possible.
+#   jump modes: gumbel and argmax_ste
+#   W_add/S_add: 0,2,4,6,8,10 with D_add/L_add=0
 #
 # Submit from repo root:
-#   sbatch scripts/submit_robustness_sbc_cc.sh
+#   sbatch scripts/submit_robustness_sbc_jump_cc.sh
+#
+# Useful pilot:
+#   sbatch --array=0-23 scripts/submit_robustness_sbc_jump_cc.sh
+#
+# Optional overrides:
+#   PAIR_ROUTE=mi_soft SBC_JUMP_STEPS=2400 JUMP_ATTEMPTS=2 sbatch ...
 
-#SBATCH --job-name=ubc_robust_sbc
+#SBATCH --job-name=ubc_robust_jump
 #SBATCH --account=def-ssanner
 #SBATCH --time=1-12:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --array=0-59
+#SBATCH --array=0-143
 #SBATCH --output=/scratch/uoftwhli/UBC-Results/slurm-logs/%x-%A_%a.out
 
 set -euo pipefail
@@ -62,9 +69,6 @@ fi
 source "${PROJECT_DIR}/ENV/bin/activate"
 hash -r
 
-# Threading: SBC is many small per-instance models, but B=20 truth tables still
-# benefit from a few BLAS threads.  Override UBC_NUM_THREADS=1 if CC scheduling
-# shows oversubscription.
 export UBC_NUM_THREADS="${UBC_NUM_THREADS:-${SLURM_CPUS_PER_TASK}}"
 export UBC_TORCH_THREADS="${UBC_TORCH_THREADS:-${UBC_NUM_THREADS}}"
 export UBC_TORCH_INTEROP_THREADS="${UBC_TORCH_INTEROP_THREADS:-1}"
@@ -92,12 +96,14 @@ DATASET_FILES=(
 BASIS_KEYS=(base true)
 W_FIELDS=(W_base W_true)
 D_FIELDS=(D_base D_true)
-S_ADD_LIST=(2 4 6 8 10)
+JUMP_MODES=(gumbel argmax_ste)
+S_ADD_LIST=(0 2 4 6 8 10)
 
 NDATA=${#DATASET_KEYS[@]}
 NBASIS=${#BASIS_KEYS[@]}
+NJUMP=${#JUMP_MODES[@]}
 NS=${#S_ADD_LIST[@]}
-TOTAL=$((NDATA * NBASIS * NS))
+TOTAL=$((NDATA * NBASIS * NJUMP * NS))
 
 if [[ "${SLURM_ARRAY_TASK_ID}" -ge "${TOTAL}" ]]; then
   echo "[error] SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID} >= TOTAL=${TOTAL}"
@@ -106,10 +112,12 @@ fi
 
 task=${SLURM_ARRAY_TASK_ID}
 s_idx=$((task % NS)); task=$((task / NS))
+jump_idx=$((task % NJUMP)); task=$((task / NJUMP))
 basis_idx=$((task % NBASIS)); task=$((task / NBASIS))
 data_idx=$((task % NDATA))
 
 S_ADD="${S_ADD_LIST[$s_idx]}"
+JUMP_MODE="${JUMP_MODES[$jump_idx]}"
 BASIS="${BASIS_KEYS[$basis_idx]}"
 W_FIELD="${W_FIELDS[$basis_idx]}"
 D_FIELD="${D_FIELDS[$basis_idx]}"
@@ -117,6 +125,7 @@ DATASET_KEY="${DATASET_KEYS[$data_idx]}"
 DATASET_IN="${DATASET_FILES[$data_idx]}"
 MAX_B="${MAX_B:-0}"
 SEED="${SEED:-1}"
+PAIR_ROUTE="${PAIR_ROUTE:-mi_hard}"
 
 TMPDIR_USE="${SLURM_TMPDIR:-/tmp}"
 mkdir -p "${TMPDIR_USE}"
@@ -126,7 +135,7 @@ python - <<'PY'
 import collections, json, os
 src = os.environ["DATASET_IN"]
 dst = os.environ["FILTERED_DATASET"]
-max_b = int(os.environ.get("MAX_B", "20"))
+max_b = int(os.environ.get("MAX_B", "0"))
 kept = total = 0
 hist = collections.Counter()
 with open(src) as f_in, open(dst, "w") as f_out:
@@ -146,12 +155,12 @@ if kept == 0:
     raise SystemExit("filtered dataset is empty")
 PY
 
-CFG="${TMPDIR_USE}/cfg_robust_sbc_${DATASET_KEY}_${BASIS}_Sadd${S_ADD}.yaml"
+CFG="${TMPDIR_USE}/cfg_robust_jump_${DATASET_KEY}_${BASIS}_${JUMP_MODE}_Sadd${S_ADD}.yaml"
 
 cat > "${CFG}" <<EOF
 seed: ${SEED}
 gate_set: "16"
-steps: ${SBC_STEPS:-3000}
+steps: ${SBC_JUMP_STEPS:-3000}
 optimizer: rmsprop
 lr: ${SBC_LR:-0.001}
 use_row_L: true
@@ -176,9 +185,29 @@ relaxation:
   hard: false
   gumbel_tau: 1.0
   eval_hard: false
+jump:
+  use: true
+  mode: "${JUMP_MODE}"
+  hard: true
+  gumbel_tau: ${JUMP_GUMBEL_TAU:-0.5}
+  eval_hard: true
+  start_frac: ${JUMP_START_FRAC:-0.6}
+  attempts: ${JUMP_ATTEMPTS:-3}
+  interval: ${JUMP_INTERVAL:-0}
+  strength: ${JUMP_STRENGTH:-4.0}
+  noise_std: ${JUMP_NOISE_STD:-0.10}
+  sample: ${JUMP_SAMPLE:-true}
+  reset_optimizer: true
+  restore_anchor_each_attempt: true
+  keep_best: true
+  keep_best_metric: decoded_row_acc
+  include_gates: true
+  include_rows: true
+  include_pairs: true
+  include_lift: true
 anneal:
   T0: ${T0:-0.60}
-  Tmin: ${TMIN:-0.06}
+  Tmin: ${TMIN:-0.03}
   direction: top_down
   schedule: cosine
   phase_scale: 0.5
@@ -189,13 +218,13 @@ sigma16:
   mode:    "rbf"
   radius:  0.75
 regs:
-  lam_entropy: 1.0e-3
+  lam_entropy: ${LAM_ENTROPY:-5.0e-3}
   lam_div_units: 5.0e-4
   lam_div_rows: 5.0e-4
-  lam_const16: 0.0
+  lam_const16: ${LAM_CONST16:-0.0}
 pair:
-  route: mi_soft
-  prior_strength: 2.0
+  route: "${PAIR_ROUTE}"
+  prior_strength: ${PRIOR_STRENGTH:-0.0}
   mi_disjoint: true
   repel: false
   mode: "log"
@@ -210,7 +239,7 @@ early_stop:
 EOF
 
 STAMP="$(date +"%Y%m%d-%H%M%S")"
-RUN_DIR="${RESULTS_ROOT}/robustness_sbc/${DATASET_KEY}/basis_${BASIS}/Sadd${S_ADD}_Ladd0/${STAMP}_job${SLURM_JOB_ID}_task${SLURM_ARRAY_TASK_ID}_seed${SEED}"
+RUN_DIR="${RESULTS_ROOT}/robustness_sbc_jump/${DATASET_KEY}/basis_${BASIS}/${JUMP_MODE}/Sadd${S_ADD}_Ladd0/${STAMP}_job${SLURM_JOB_ID}_task${SLURM_ARRAY_TASK_ID}_seed${SEED}"
 mkdir -p "${RUN_DIR}"
 cp "${CFG}" "${RUN_DIR}/config.used.yaml"
 
@@ -219,6 +248,7 @@ echo "[info] dataset_in=${DATASET_IN}"
 echo "[info] dataset_filtered=${FILTERED_DATASET}"
 echo "[info] dataset_key=${DATASET_KEY} max_B=${MAX_B}"
 echo "[info] basis=${BASIS} W_field=${W_FIELD} D_field=${D_FIELD}"
+echo "[info] jump_mode=${JUMP_MODE} pair_route=${PAIR_ROUTE}"
 echo "[info] S_add=${S_ADD} L_add=0 seed=${SEED}"
 echo "[info] out=${RUN_DIR}"
 

@@ -153,6 +153,14 @@
 + /robustness_sbc/**/*.yaml
 + /robustness_sbc/**/*.yml
 
++ /robustness_sbc_jump/
++ /robustness_sbc_jump/**/
++ /robustness_sbc_jump/**/*.json
++ /robustness_sbc_jump/**/*.jsonl
++ /robustness_sbc_jump/**/*.csv
++ /robustness_sbc_jump/**/*.yaml
++ /robustness_sbc_jump/**/*.yml
++
 # ---- Current benchmark Slurm logs ----
 + /slurm-logs/
 + /slurm-logs/ubc_best_*.out
@@ -162,6 +170,7 @@
 + /slurm-logs/ubc_gumbel_grid*.out
 + /slurm-logs/ubc_robust_mlp*.out
 + /slurm-logs/ubc_robust_sbc*.out
++ /slurm-logs/ubc_robust_jump*.out
 
 # ---- Exclude everything else ----
 - **
