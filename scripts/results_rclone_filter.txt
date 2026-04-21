@@ -1,0 +1,167 @@
+# rclone filter for the UBC result files we care about.
+#
+# Use relative to the UBC-Results root, e.g.
+#   rclone copy ~/scratch/UBC-Results GDrive:UofT_PhD/Collab_Prof_Kratsios/UBC-Results --filter-from scripts/results_rclone_filter.txt --progress
+#   rclone copy GDrive:UofT_PhD/Collab_Prof_Kratsios/UBC-Results .results/UBC-Results --filter-from scripts/results_rclone_filter.txt --progress
+#
+# Kept file types under the named roots:
+#   *.json       summary.json, config.json, sample.meta.json, dataset.sample.meta.json
+#   *.jsonl      results.jsonl
+#   *.csv        expr_table.csv, meta_runs.csv, meta_groups.csv, best_*.csv, diagnostics tables
+#   *.yaml/*.yml config.used.yaml
+#
+# Selected logs are kept for reproducibility/debugging of the current benchmark
+# campaigns. Model checkpoints (*.pt) and all other files are excluded.
+
+# ---- Best main/joint runs and analysis ----
++ /bench_default_best_main/
++ /bench_default_best_main/**/
++ /bench_default_best_main/**/*.json
++ /bench_default_best_main/**/*.jsonl
++ /bench_default_best_main/**/*.csv
++ /bench_default_best_main/**/*.yaml
++ /bench_default_best_main/**/*.yml
+
++ /bench_default_best_joint_1216/
++ /bench_default_best_joint_1216/**/
++ /bench_default_best_joint_1216/**/*.json
++ /bench_default_best_joint_1216/**/*.jsonl
++ /bench_default_best_joint_1216/**/*.csv
++ /bench_default_best_joint_1216/**/*.yaml
++ /bench_default_best_joint_1216/**/*.yml
+
++ /bench_default_best_analysis/
++ /bench_default_best_analysis/**/
++ /bench_default_best_analysis/**/*.json
++ /bench_default_best_analysis/**/*.jsonl
++ /bench_default_best_analysis/**/*.csv
++ /bench_default_best_analysis/**/*.yaml
++ /bench_default_best_analysis/**/*.yml
+
+# ---- Hard-EM main grid, 200-row pilot, and backfills ----
++ /bench_default_main_hardem_grid/
++ /bench_default_main_hardem_grid/**/
++ /bench_default_main_hardem_grid/**/*.json
++ /bench_default_main_hardem_grid/**/*.jsonl
++ /bench_default_main_hardem_grid/**/*.csv
++ /bench_default_main_hardem_grid/**/*.yaml
++ /bench_default_main_hardem_grid/**/*.yml
+
++ /bench_default_main_hardem_grid_analysis/
++ /bench_default_main_hardem_grid_analysis/**/
++ /bench_default_main_hardem_grid_analysis/**/*.json
++ /bench_default_main_hardem_grid_analysis/**/*.jsonl
++ /bench_default_main_hardem_grid_analysis/**/*.csv
++ /bench_default_main_hardem_grid_analysis/**/*.yaml
++ /bench_default_main_hardem_grid_analysis/**/*.yml
+
++ /bench_default_main_hardem_grid200/
++ /bench_default_main_hardem_grid200/**/
++ /bench_default_main_hardem_grid200/**/*.json
++ /bench_default_main_hardem_grid200/**/*.jsonl
++ /bench_default_main_hardem_grid200/**/*.csv
++ /bench_default_main_hardem_grid200/**/*.yaml
++ /bench_default_main_hardem_grid200/**/*.yml
+
++ /bench_default_main_hardem_grid200_analysis/
++ /bench_default_main_hardem_grid200_analysis/**/
++ /bench_default_main_hardem_grid200_analysis/**/*.json
++ /bench_default_main_hardem_grid200_analysis/**/*.jsonl
++ /bench_default_main_hardem_grid200_analysis/**/*.csv
++ /bench_default_main_hardem_grid200_analysis/**/*.yaml
++ /bench_default_main_hardem_grid200_analysis/**/*.yml
+
++ /bench_default_main_hardem_grid200_from_full/
++ /bench_default_main_hardem_grid200_from_full/**/
++ /bench_default_main_hardem_grid200_from_full/**/*.json
++ /bench_default_main_hardem_grid200_from_full/**/*.jsonl
++ /bench_default_main_hardem_grid200_from_full/**/*.csv
++ /bench_default_main_hardem_grid200_from_full/**/*.yaml
++ /bench_default_main_hardem_grid200_from_full/**/*.yml
+
++ /bench_default_main_hardem_grid200_from_full_analysis/
++ /bench_default_main_hardem_grid200_from_full_analysis/**/
++ /bench_default_main_hardem_grid200_from_full_analysis/**/*.json
++ /bench_default_main_hardem_grid200_from_full_analysis/**/*.jsonl
++ /bench_default_main_hardem_grid200_from_full_analysis/**/*.csv
++ /bench_default_main_hardem_grid200_from_full_analysis/**/*.yaml
++ /bench_default_main_hardem_grid200_from_full_analysis/**/*.yml
+
++ /bench_default_main_hardem_grid200_from_logs/
++ /bench_default_main_hardem_grid200_from_logs/**/
++ /bench_default_main_hardem_grid200_from_logs/**/*.json
++ /bench_default_main_hardem_grid200_from_logs/**/*.jsonl
++ /bench_default_main_hardem_grid200_from_logs/**/*.csv
++ /bench_default_main_hardem_grid200_from_logs/**/*.yaml
++ /bench_default_main_hardem_grid200_from_logs/**/*.yml
+
++ /bench_default_main_hardem_grid200_from_logs_analysis/
++ /bench_default_main_hardem_grid200_from_logs_analysis/**/
++ /bench_default_main_hardem_grid200_from_logs_analysis/**/*.json
++ /bench_default_main_hardem_grid200_from_logs_analysis/**/*.jsonl
++ /bench_default_main_hardem_grid200_from_logs_analysis/**/*.csv
++ /bench_default_main_hardem_grid200_from_logs_analysis/**/*.yaml
++ /bench_default_main_hardem_grid200_from_logs_analysis/**/*.yml
+
+# ---- Other hard-EM candidate sweeps ----
++ /bench_default_gumbel_grid/
++ /bench_default_gumbel_grid/**/
++ /bench_default_gumbel_grid/**/*.json
++ /bench_default_gumbel_grid/**/*.jsonl
++ /bench_default_gumbel_grid/**/*.csv
++ /bench_default_gumbel_grid/**/*.yaml
++ /bench_default_gumbel_grid/**/*.yml
+
++ /bench_default_gumbel_grid_analysis/
++ /bench_default_gumbel_grid_analysis/**/
++ /bench_default_gumbel_grid_analysis/**/*.json
++ /bench_default_gumbel_grid_analysis/**/*.jsonl
++ /bench_default_gumbel_grid_analysis/**/*.csv
++ /bench_default_gumbel_grid_analysis/**/*.yaml
++ /bench_default_gumbel_grid_analysis/**/*.yml
+
++ /bench_default_main_sadd_ladd_grid/
++ /bench_default_main_sadd_ladd_grid/**/
++ /bench_default_main_sadd_ladd_grid/**/*.json
++ /bench_default_main_sadd_ladd_grid/**/*.jsonl
++ /bench_default_main_sadd_ladd_grid/**/*.csv
++ /bench_default_main_sadd_ladd_grid/**/*.yaml
++ /bench_default_main_sadd_ladd_grid/**/*.yml
+
++ /bench_default_main_sadd_ladd_grid_analysis/
++ /bench_default_main_sadd_ladd_grid_analysis/**/
++ /bench_default_main_sadd_ladd_grid_analysis/**/*.json
++ /bench_default_main_sadd_ladd_grid_analysis/**/*.jsonl
++ /bench_default_main_sadd_ladd_grid_analysis/**/*.csv
++ /bench_default_main_sadd_ladd_grid_analysis/**/*.yaml
++ /bench_default_main_sadd_ladd_grid_analysis/**/*.yml
+
+# ---- Robustness MLP/SBC sweeps ----
++ /robustness_mlp/
++ /robustness_mlp/**/
++ /robustness_mlp/**/*.json
++ /robustness_mlp/**/*.jsonl
++ /robustness_mlp/**/*.csv
++ /robustness_mlp/**/*.yaml
++ /robustness_mlp/**/*.yml
+
++ /robustness_sbc/
++ /robustness_sbc/**/
++ /robustness_sbc/**/*.json
++ /robustness_sbc/**/*.jsonl
++ /robustness_sbc/**/*.csv
++ /robustness_sbc/**/*.yaml
++ /robustness_sbc/**/*.yml
+
+# ---- Current benchmark Slurm logs ----
++ /slurm-logs/
++ /slurm-logs/ubc_best_*.out
++ /slurm-logs/ubc_main_hardem*.out
++ /slurm-logs/ubc_hardem200_*.out
++ /slurm-logs/ubc_main_hardem200_*.out
++ /slurm-logs/ubc_gumbel_grid*.out
++ /slurm-logs/ubc_robust_mlp*.out
++ /slurm-logs/ubc_robust_sbc*.out
+
+# ---- Exclude everything else ----
+- **

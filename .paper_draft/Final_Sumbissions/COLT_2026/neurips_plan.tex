@@ -1,0 +1,657 @@
+\documentclass[11pt]{article}
+
+% -----------------------------------------------------------------------------
+% Standalone theory draft for the NeurIPS resubmission.
+% This file is intentionally self-contained; individual theorem blocks can be
+% copied into the NeurIPS paper after replacing local macros by paper macros.
+% -----------------------------------------------------------------------------
+
+\usepackage[margin=1.05in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{bbm}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{microtype}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!55!black,
+  citecolor=blue!55!black,
+  urlcolor=blue!55!black
+}
+
+\definecolor{theoryblue}{RGB}{27,70,135}
+\definecolor{softorange}{RGB}{180,92,28}
+\definecolor{certgreen}{RGB}{27,120,80}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{example}[theorem]{Example}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\newcommand{\X}{\mathcal X}
+\newcommand{\A}{\mathcal A}
+\newcommand{\Hcal}{\mathcal H}
+\newcommand{\Dcal}{\mathcal D}
+\newcommand{\E}{\mathbb E}
+\newcommand{\Pbb}{\mathbb P}
+\newcommand{\one}{\mathbbm 1}
+\newcommand{\loss}{\operatorname{loss}}
+\newcommand{\Risk}{\operatorname{Risk}}
+\newcommand{\TV}{\operatorname{TV}}
+\newcommand{\tail}{\operatorname{tail}}
+\newcommand{\SM}{\operatorname{softmax}}
+\newcommand{\argmax}{\operatorname*{arg\,max}}
+\newcommand{\SBC}{\textnormal{\textsc{SBC}}}
+\newcommand{\soft}{\operatorname{soft}}
+\newcommand{\hard}{\operatorname{hard}}
+\newcommand{\decode}{\operatorname{decode}}
+\newcommand{\SoftEM}{\operatorname{SoftEM}}
+\newcommand{\DecEM}{\operatorname{DecodedEM}}
+\newcommand{\SoftAcc}{\operatorname{SoftRowAcc}}
+\newcommand{\DecAcc}{\operatorname{DecodedRowAcc}}
+\newcommand{\Gap}{\operatorname{Gap}}
+\newcommand{\errround}{\varepsilon_{\rm round}}
+\newcommand{\gammsoft}{\gamma_{\rm soft}}
+\newcommand{\gammhard}{\gamma_{\rm hard}}
+\newcommand{\Real}{\mathbb R}
+\newcommand{\bits}{\{0,1\}}
+\newcommand{\ceil}[1]{\left\lceil #1 \right\rceil}
+\newcommand{\norm}[1]{\left\lVert #1\right\rVert}
+
+\title{Theory Draft for a NeurIPS Resubmission:\\
+Universality, Learnability, Optimization, and the Soft-to-Hard Gap for Stochastic Boolean Circuits}
+\author{Draft prepared for integration into the \SBC{} manuscript}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This draft isolates the mathematical story that should accompany a NeurIPS resubmission of the stochastic Boolean circuit (\SBC{}) paper.  The central recommendation is to separate three semantics that were partly conflated in the COLT-era experimental narrative: (i) the \emph{sampled/discrete circuit} semantics, for which the original certifiability and universality proof applies; (ii) the \emph{soft relaxation} used for differentiable training; and (iii) the \emph{locally argmax decoded circuit} used for symbolic readout.  Under this separation, high soft exact match is not a certificate of high decoded exact match.  We give a compact theory package: an inherited universality theorem, a finite-class statistical learnability result for decoded circuits, local optimization and hardening statements, a formal soft-to-hard gap definition, an explicit one-gate separation example, a margin-based rounding theorem, and a sampling/beam-decoding theorem for the induced distribution over circuits.
+\end{abstract}
+
+\vspace{0.5em}
+\noindent\textbf{Recommended thesis for the NeurIPS version.}
+The original COLT theorem proves that the architecture parameterizes distributions over valid Boolean circuits and can place arbitrarily large probability on a circuit computing any desired Boolean function.  The new experimental observation--high soft EM but much lower decoded EM--does not contradict that theorem.  Instead, it reveals a mathematically meaningful \emph{relaxation-to-circuit gap}.  The NeurIPS theory section should therefore say:
+\begin{quote}
+\emph{Universality is a property of the discrete circuit distribution; differentiable training uses a soft relaxation whose thresholded predictions may be correct even when local argmax decoding is not.  We characterize when the two semantics coincide, prove that failure of the rounding condition explains the observed soft-vs-hard gap, and give statistically justified alternatives to naive local decoding.}
+\end{quote}
+
+\tableofcontents
+
+\section{What should be inherited from the COLT proof}
+
+The COLT submission already contains the three structural ingredients that should remain in the NeurIPS paper.
+\begin{enumerate}[leftmargin=1.4em]
+\item \textbf{Certifiable circuit semantics.}  For every parameter value, a sampled \SBC{} realization is almost surely a fan-in-2, fan-out-1 Boolean circuit.
+\item \textbf{Universality.}  For every Boolean target $f:\bits^B\to\bits$ and every failure probability $\delta>0$, there are logits such that the sampled circuit computes $f$ on the full cube with probability at least $1-\delta$.
+\item \textbf{Sparse-function efficiency.}  If $f$ is an $S$-junta with $S=O(\log B)$, then the DNF/tree construction gives a polynomial-size template; in the near-linear case $S\le \log_2 B$ the number of lifted leaves/gates is $O(B\log B)$ up to constants.
+\end{enumerate}
+
+The revised theory should not weaken these statements.  It should instead add a fourth layer: \emph{what differentiable optimization and local decoding do, and do not, guarantee.}
+
+\section{Three semantics: sampled, soft, and locally decoded}
+
+Let $\X_B\coloneqq \bits^B$.  Fix an \SBC{} template with $M$ categorical decision sites.  A site may be a lifted-bit selector, a left or right parent selector, a gate selector, or a readout selector.  Site $s\in[M]$ has $K_s$ possible choices.  A discrete assignment
+\[
+    a=(a_1,\ldots,a_M)\in \A\coloneqq \prod_{s=1}^M [K_s]
+\]
+determines a Boolean circuit $C_a:\X_B\to\bits$.  Parameters $\theta$ determine categorical vectors
+\[
+    p_s(\theta)\in\Delta_{K_s},\qquad s=1,\ldots,M.
+\]
+
+\begin{definition}[Sampled circuit semantics]
+The sampled \SBC{} distribution is the product distribution
+\[
+    \Pi_\theta(a)\coloneqq \prod_{s=1}^M p_s(\theta)_{a_s},
+    \qquad a\in\A.
+\]
+Drawing $a\sim\Pi_\theta$ and returning $C_a$ gives a random Boolean circuit.
+\end{definition}
+
+\begin{definition}[Local argmax decoding]
+Fix a deterministic tie-breaking rule.  The local decode is
+\[
+    a^+(\theta)_s\coloneqq \argmax_{i\in[K_s]} p_s(\theta)_i,
+    \qquad
+    H_\theta\coloneqq C_{a^+(\theta)}.
+\]
+We call $H_\theta:\X_B\to\bits$ the decoded circuit.
+\end{definition}
+
+\begin{definition}[Soft relaxation]
+The differentiable training forward pass is denoted
+\[
+    F_\theta:\X_B\to[0,1].
+\]
+It is obtained by replacing categorical choices by soft mixtures and using the smooth gate interpolants implemented in training.  In general, $F_\theta$ need not equal $H_\theta$, and it need not equal $\E_{a\sim\Pi_\theta} C_a$ unless the implementation is specifically designed to make that identity true.
+\end{definition}
+
+This separation is the conceptual fix for the resubmission.  Certifiability and universality concern $C_a$ under $a\sim\Pi_\theta$ or the decoded circuit $H_\theta$.  The differentiable model $F_\theta$ is an optimization proxy.
+
+\section{Metrics for the relaxation-to-circuit gap}
+
+For a target $f:\X_B\to\bits$, define thresholding by $\tau(z)=\one\{z\ge 1/2\}$.  The exact-match and row-accuracy metrics are
+\begin{align*}
+\SoftEM(\theta,f)
+&\coloneqq
+\one\{\tau(F_\theta(x))=f(x)\ \forall x\in\X_B\},\\
+\DecEM(\theta,f)
+&\coloneqq
+\one\{H_\theta(x)=f(x)\ \forall x\in\X_B\},\\
+\SoftAcc(\theta,f)
+&\coloneqq
+2^{-B}\sum_{x\in\X_B}\one\{\tau(F_\theta(x))=f(x)\},\\
+\DecAcc(\theta,f)
+&\coloneqq
+2^{-B}\sum_{x\in\X_B}\one\{H_\theta(x)=f(x)\}.
+\end{align*}
+The exact-match and row-level gaps are
+\begin{align*}
+    \Gap_{\rm EM}(\theta,f)&\coloneqq \SoftEM(\theta,f)-\DecEM(\theta,f),\\
+    \Gap_{\rm row}(\theta,f)&\coloneqq \SoftAcc(\theta,f)-\DecAcc(\theta,f).
+\end{align*}
+For a benchmark distribution over formulas, report the averages of these quantities across instances and seeds.
+
+We also define the signed soft output margin
+\[
+    \gammsoft(\theta,f)
+    \coloneqq
+    \min_{x\in\X_B} (2f(x)-1)\big(F_\theta(x)-1/2\big).
+\]
+Thus $\gammsoft(\theta,f)>0$ is equivalent to $\SoftEM(\theta,f)=1$ under the chosen threshold convention.
+
+For a categorical vector $p\in\Delta_K$, define
+\[
+    \tail(p)\coloneqq 1-\max_i p_i,
+    \qquad
+    \operatorname{margin}(p)\coloneqq p_{(1)}-p_{(2)},
+\]
+where $p_{(1)}\ge p_{(2)}\ge\cdots$ are the sorted entries.  Tail mass controls perturbation from the local argmax choice; margin controls decoder stability under perturbations of the logits.
+
+\section{Inherited universality as a distributional statement}
+
+The following theorem is the clean NeurIPS formulation of the COLT universality proof.  It abstracts the DNF/tree construction into the statement ``$f$ is represented by a discrete assignment $a^*$'' and then uses logits to concentrate the sampled circuit distribution on that assignment.
+
+\begin{theorem}[Distributional universality from a represented circuit]
+\label{thm:distributional-universality}
+Assume that a template contains a discrete assignment $a^*\in\A$ whose circuit computes $f$ on the full cube:
+\[
+    C_{a^*}(x)=f(x),\qquad \forall x\in\X_B.
+\]
+For $\beta>0$, choose logits at site $s$ so that the desired option $a_s^*$ has logit $\beta$ and all other options have logit $0$.  Then
+\[
+    \Pbb_{a\sim\Pi_{\theta_\beta}}\{C_a=f\text{ on }\X_B\}
+    \ge
+    1-\sum_{s=1}^M (K_s-1)e^{-\beta}.
+\]
+Consequently, choosing
+\[
+    \beta\ge \log\!\left(\frac{\sum_{s=1}^M (K_s-1)}{\delta}\right)
+\]
+gives probability at least $1-\delta$ of sampling a correct circuit.
+\end{theorem}
+
+\begin{proof}
+At site $s$, the desired option has probability
+\[
+    p_s(a_s^*)=\frac{e^\beta}{e^\beta+K_s-1}
+    \ge 1-(K_s-1)e^{-\beta}.
+\]
+The event that every site samples its desired option has probability $\prod_s p_s(a_s^*)$.  A union bound gives
+\[
+    \Pbb\{\exists s: a_s\ne a_s^*\}
+    \le \sum_s \bigl(1-p_s(a_s^*)\bigr)
+    \le \sum_s (K_s-1)e^{-\beta}.
+\]
+On the complementary event $a=a^*$, the sampled circuit computes $f$ on all inputs.
+\end{proof}
+
+\begin{corollary}[COLT universality, restated]
+For every Boolean function $f:\bits^B\to\bits$ and every $\delta>0$, the complete-binary-tree construction used in the COLT proof supplies a template and a represented assignment $a^*$ satisfying Theorem~\ref{thm:distributional-universality}.  Hence the sampled \SBC{} computes $f$ on the full cube with probability at least $1-\delta$.
+\end{corollary}
+
+\begin{corollary}[Junta scaling]
+If $f$ is an $S$-junta, the same DNF/tree argument applied only to the relevant variables gives a represented circuit with at most $O(S2^S)$ lifted leaves/gates and depth at most $S+\ceil{\log_2 S}$.  If $S\le C\log_2 B$, this size is $O(B^C\log B)$; in particular, if $C\le1$, it is $O(B\log B)$.
+\end{corollary}
+
+\paragraph{Resubmission wording.}
+This is a representation theorem for the \emph{sampled/discrete} model.  It should not be described as saying that a generic soft relaxation trained by SGD will decode correctly by local argmax.  The next sections give the missing learnability and optimization pieces.
+
+\section{Statistical learnability of the decoded circuit class}
+
+A defensible learnability statement is available because a fixed \SBC{} template induces a finite hypothesis class of decoded circuits.  This gives a standard finite-class uniform convergence bound.  It is statistical, not computational: it says empirical risk minimization over the discrete class generalizes, but it does not say that gradient descent globally solves the combinatorial search problem.
+
+\begin{definition}[Decoded hypothesis class]
+For a fixed template, define
+\[
+    \Hcal_{\rm hard}\coloneqq\{C_a:a\in\A\}.
+\]
+For a distribution $\Dcal$ on $\X_B$, define the $0$--$1$ risk and empirical risk
+\[
+    R(h)\coloneqq \Pbb_{x\sim\Dcal}\{h(x)\ne f(x)\},
+    \qquad
+    \widehat R_n(h)\coloneqq \frac1n\sum_{i=1}^n\one\{h(x_i)\ne f(x_i)\}.
+\]
+\end{definition}
+
+\begin{theorem}[Finite-class PAC learnability of decoded \SBC{} templates]
+\label{thm:finite-class-pac}
+Let $x_1,\ldots,x_n\overset{\rm iid}{\sim}\Dcal$.  With probability at least $1-\delta$, every $h\in\Hcal_{\rm hard}$ satisfies
+\[
+    |R(h)-\widehat R_n(h)|
+    \le
+    \sqrt{\frac{\log(2|\Hcal_{\rm hard}|/\delta)}{2n}}.
+\]
+Consequently, any empirical risk minimizer $\widehat h$ over $\Hcal_{\rm hard}$ satisfies
+\[
+    R(\widehat h)
+    \le
+    \inf_{h\in\Hcal_{\rm hard}} R(h)
+    +2\sqrt{\frac{\log(2|\Hcal_{\rm hard}|/\delta)}{2n}}.
+\]
+Moreover,
+\[
+    \log|\Hcal_{\rm hard}|
+    \le
+    \sum_{s=1}^M \log K_s.
+\]
+For the usual fan-in-2, 16-gate template with lifted input width $B^\uparrow$ and layer widths $B_1,\ldots,B_L$, a crude bound is
+\[
+\log|\Hcal_{\rm hard}|
+\le
+B^\uparrow\log(2B)
++
+\sum_{\ell=1}^{L-1}B_{\ell+1}\bigl(\log 16+2\log B_\ell\bigr),
+\]
+with $2\log B_\ell$ replaced by $\log(B_\ell(B_\ell-1))$ if distinct parent choices are enforced.
+\end{theorem}
+
+\begin{proof}
+For a fixed $h$, Hoeffding's inequality gives
+\[
+    \Pbb\{|R(h)-\widehat R_n(h)|>\epsilon\}\le 2e^{-2n\epsilon^2}.
+\]
+Taking a union bound over $\Hcal_{\rm hard}$ and solving for $\epsilon$ proves the uniform bound.  The ERM inequality follows from
+\[
+R(\widehat h)\le \widehat R_n(\widehat h)+\epsilon
+\le \widehat R_n(h^*)+\epsilon
+\le R(h^*)+2\epsilon,
+\]
+where $h^*$ is any minimizer of $R$ over $\Hcal_{\rm hard}$.  The cardinality bound follows because each hard circuit is specified by one choice at each categorical site.
+\end{proof}
+
+\begin{remark}[Interpretation]
+For a polynomial-size junta template, $\log|\Hcal_{\rm hard}|$ is polynomial in $B$, so the decoded circuit class is statistically learnable from polynomially many random examples.  In the experiments, the full truth table is used, so there is no generalization gap on the uniform cube; the remaining problem is optimization/decoding.
+\end{remark}
+
+\section{Optimization: what can be claimed safely}
+
+\subsection{Existence of annealed near-minimizers}
+
+The universality proof gives not only a correct discrete circuit but a logit ray along which the soft model approaches that circuit, provided the soft modules are bounded and Lipschitz.  This is the right optimization-side statement: there are low-loss regions connected to the target circuit, but the theorem does not say SGD must find them globally.
+
+\begin{assumption}[Soft module regularity]
+\label{ass:module-regularity}
+On the domain $[0,1]^d$ relevant to the forward pass, each relaxed module is bounded in $[0,1]$ and Lipschitz with respect to the $\ell_\infty$ norm.  Let the product/sum of downstream Lipschitz amplifications be summarized by constants $\Lambda_s<\infty$ for sites $s=1,\ldots,M$.
+\end{assumption}
+
+The gate interpolants used in the implementation satisfy this assumption on compact domains.  For smooth RBF or bump features this is immediate; for multilinear/Lagrange features it follows from bounded derivatives on $[0,1]^2$.
+
+\begin{theorem}[Annealed realizability path]
+\label{thm:annealed-path}
+Assume a target $f$ is represented by a discrete assignment $a^*$ and Assumption~\ref{ass:module-regularity} holds.  Let $\theta_\beta$ be the logit ray from Theorem~\ref{thm:distributional-universality}.  Then the local decode is constant,
+\[
+    H_{\theta_\beta}=C_{a^*}=f,
+    \qquad \forall \beta>0,
+\]
+and there is a constant $A$ depending only on the template and the Lipschitz bounds such that
+\[
+    \sup_{x\in\X_B}|F_{\theta_\beta}(x)-f(x)|
+    \le
+    A e^{-\beta}.
+\]
+In particular, for all sufficiently large $\beta$, both soft exact match and decoded exact match equal one.  The binary cross-entropy of the soft predictor on the full truth table converges to zero at rate $O(e^{-\beta})$ up to the usual logarithmic constants.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+The desired option at every categorical site has tail probability at most $(K_s-1)e^{-\beta}$.  Replacing a convex mixture at one site by its winning primitive changes the corresponding module output by at most a constant times that tail mass.  Propagating these perturbations through downstream Lipschitz modules gives
+\[
+\sup_x |F_{\theta_\beta}(x)-H_{\theta_\beta}(x)|
+\le
+\sum_s \Lambda_s (K_s-1)e^{-\beta}
+\le A e^{-\beta}.
+\]
+Since $H_{\theta_\beta}=f$ is binary-valued, the soft output converges uniformly to $f$.  Once the uniform error is below $1/2$, thresholding is correct.  The cross-entropy bound follows from $-\log(1-u)\le 2u$ for small $u$ applied to the error probability on each truth-table row.
+\end{proof}
+
+\subsection{Decoder basins and hardening}
+
+The local argmax decoder is piecewise constant in parameter space.  Within a fixed decoder basin, hardening can reduce the soft-to-hard discrepancy without changing the decoded circuit.
+
+\begin{definition}[Decoder basin]
+For an assignment $a\in\A$ and margin $m>0$, define
+\[
+    \mathcal B(a,m)
+    \coloneqq
+    \left\{\theta:
+    p_s(\theta)_{a_s}\ge \max_{i\ne a_s}p_s(\theta)_i+m\quad\forall s
+    \right\}.
+\]
+On $\mathcal B(a,m)$, the local decode is $a$.
+\end{definition}
+
+\begin{proposition}[Hardening preserves the decoded circuit]
+\label{prop:hardening}
+Suppose $\theta\in\mathcal B(a,m)$.  Construct $\theta(t)$ by adding $t>0$ to the logit of option $a_s$ at every site $s$ and leaving all other logits fixed.  Then $\theta(t)\in\mathcal B(a,m)$ for all $t\ge0$, so $H_{\theta(t)}=C_a$ for all $t\ge0$.  Moreover,
+\[
+    \tail(p_s(\theta(t)))\le (K_s-1)e^{-t}\,\tail(p_s(\theta))
+\]
+up to a site-dependent constant determined by the initial logits.  Thus the rounding error bound in Section~\ref{sec:rounding} decays exponentially along the hardening path.
+\end{proposition}
+
+\begin{proof}
+Increasing only the winning logit cannot change the identity of the winner.  The softmax odds between any non-winning option $i$ and the winning option $a_s$ are multiplied by $e^{-t}$, so the total non-winning probability decays exponentially.
+\end{proof}
+
+\begin{remark}[Optimization recommendation]
+A safe training protocol is: train the soft relaxation; evaluate both soft and decoded metrics; once a good decoded circuit is found by argmax, sampling, beam search, or coordinate search, run a hardening phase that increases categorical margins while monitoring decoded EM.  This phase cannot damage decoded EM as long as the winner identities are fixed.
+\end{remark}
+
+\subsection{Loss-aware discrete coordinate search}
+
+Because the benchmark evaluates full truth tables, the discrete loss of any decoded candidate can be scored exactly.  This suggests a simple post-training optimizer over the discrete assignment $a$.
+
+\begin{proposition}[Finite termination of coordinate decoding]
+\label{prop:coordinate-decoding}
+Initialize $a^{(0)}$ by local argmax, by a sampled circuit, or by a beam candidate.  Repeatedly scan sites $s=1,\ldots,M$ and replace $a_s$ by the value in $[K_s]$ that minimizes full-truth-table loss while all other coordinates are fixed; accept only strict improvements.  Then the procedure terminates after finitely many accepted moves at a coordinatewise local minimum of the full-truth-table loss.  If it reaches loss zero, the resulting circuit is a certificate of exact correctness.
+\end{proposition}
+
+\begin{proof}
+The assignment space $\A$ is finite.  Every accepted move strictly decreases the empirical/full-cube loss, so no assignment can repeat.  Therefore the process terminates.  At termination, no single-site change improves the loss, which is exactly coordinatewise local optimality.
+\end{proof}
+
+This is not a global optimization guarantee, but it is a rigorous and directly implementable alternative to naive local argmax.
+
+\section{Why soft EM can be high while decoded EM is low}
+
+The soft relaxation is a convex/compositional object.  Thresholding a convex mixture of primitive circuits can produce a correct Boolean truth table even when the largest local component is not a correct circuit.  The following one-gate example shows that a soft-to-hard gap can occur with unique local argmax; it is not merely a tie-breaking artifact.
+
+\begin{example}[One-gate soft success, hard failure]
+\label{ex:one-gate-gap}
+Let the target be $f(a,b)=a\lor b$ on $\bits^2$.  Consider one relaxed gate that mixes three valid Boolean gates:
+\[
+    g_1(a,b)=a,
+    \qquad
+    g_2(a,b)=b,
+    \qquad
+    g_3(a,b)=1.
+\]
+Let the soft weights be
+\[
+    p_1=0.41,
+    \qquad p_2=0.39,
+    \qquad p_3=0.20.
+\]
+Then the soft output is
+\[
+    F(a,b)=0.41a+0.39b+0.20.
+\]
+Thresholding at $1/2$ gives
+\[
+\begin{array}{c|cccc}
+(a,b) & (0,0)&(1,0)&(0,1)&(1,1)\\\midrule
+F(a,b)&0.20&0.61&0.59&1.00
+\end{array}
+\]
+so $\tau(F)=a\lor b$ on the full truth table, with soft margin $\gammsoft=0.09$.  However, the unique local argmax choice is $g_1(a,b)=a$, whose decoded truth table is wrong at $(0,1)$.  Hence $\SoftEM=1$ and $\DecEM=0$.
+\end{example}
+
+\begin{remark}
+The example has a large categorical tail mass: $\tail(p)=0.59$.  The margin-based rounding theorem below fails because the rounding perturbation is larger than the soft output margin.  This is exactly the diagnostic pattern one should expect in experiments where soft EM is high but decoded EM drops.
+\end{remark}
+
+\section{A rounding theorem under categorical and output margins}
+\label{sec:rounding}
+
+We now state the central theorem explaining when soft correctness transfers to decoded correctness.
+
+\begin{assumption}[Layerwise perturbation control]
+\label{ass:layerwise-control}
+Write the soft forward pass as $z_0=x$ and
+\[
+    z_{\ell+1}=\Phi_{\ell,p_\ell}(z_\ell),
+    \qquad \ell=0,\ldots,L-1,
+\]
+and the locally decoded forward pass as $\hat z_0=x$ and
+\[
+    \hat z_{\ell+1}=\Phi_{\ell,a^+_\ell}(\hat z_\ell).
+\]
+Assume that for each layer $\ell$:
+\begin{enumerate}[leftmargin=1.4em]
+\item the soft layer is $L_\ell$-Lipschitz in $\ell_\infty$ norm;
+\item replacing all soft categorical choices in that layer by their local argmax choices changes the layer output by at most $\alpha_\ell \tau_\ell$ at fixed input:
+\[
+    \sup_{z\in[0,1]^{d_\ell}}
+    \norm{\Phi_{\ell,p_\ell}(z)-\Phi_{\ell,a^+_\ell}(z)}_\infty
+    \le \alpha_\ell\tau_\ell.
+\]
+Here $\tau_\ell$ may be the maximum or sum of tail masses of categorical sites in layer $\ell$, and $\alpha_\ell$ is a bounded range constant.
+\end{enumerate}
+\end{assumption}
+
+For \SBC{} layers with $[0,1]$-valued primitive gates, one can take $\alpha_\ell\tau_\ell$ as a sum of site-level terms $\sum_{s\in\ell}D_s\tail(p_s)$, where $D_s\le1$ for scalar convex gate mixtures and analogous bounded-diameter constants for selectors/readout mixtures.
+
+\begin{theorem}[Local rounding under margins]
+\label{thm:rounding}
+Under Assumption~\ref{ass:layerwise-control}, the soft and decoded outputs satisfy
+\[
+    \sup_{x\in\X_B}|F_\theta(x)-H_\theta(x)|
+    \le
+    \errround(\theta)
+    \coloneqq
+    \sum_{\ell=0}^{L-1}
+    \alpha_\ell\tau_\ell
+    \prod_{r=\ell+1}^{L-1} L_r.
+\]
+Consequently:
+\begin{enumerate}[leftmargin=1.4em]
+\item \textbf{Soft-to-hard certificate.}  If $\gammsoft(\theta,f)>\errround(\theta)$, then $H_\theta(x)=f(x)$ for every $x\in\X_B$.  Hence $\DecEM(\theta,f)=1$.
+\item \textbf{Hard-to-soft certificate.}  If $H_\theta=f$ on $\X_B$ and $\errround(\theta)<1/2$, then $\SoftEM(\theta,f)=1$, with soft margin at least $1/2-\errround(\theta)$.
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+Let
+\[
+    e_\ell\coloneqq \sup_{x\in\X_B}\norm{z_\ell(x)-\hat z_\ell(x)}_\infty.
+\]
+Since $z_0=\hat z_0$, $e_0=0$.  By the triangle inequality and Assumption~\ref{ass:layerwise-control},
+\begin{align*}
+ e_{\ell+1}
+ &\le
+ \sup_x\norm{\Phi_{\ell,p_\ell}(z_\ell(x))-\Phi_{\ell,p_\ell}(\hat z_\ell(x))}_\infty
+ +
+ \sup_x\norm{\Phi_{\ell,p_\ell}(\hat z_\ell(x))-\Phi_{\ell,a^+_\ell}(\hat z_\ell(x))}_\infty\\
+ &\le L_\ell e_\ell + \alpha_\ell\tau_\ell.
+\end{align*}
+Iterating the recursion gives the displayed bound for $e_L$, which is the output discrepancy.
+
+For the soft-to-hard certificate, suppose $f(x)=1$.  Then $F_\theta(x)\ge 1/2+\gammsoft$.  If $\gammsoft>\errround$, then $H_\theta(x)>1/2$.  Since $H_\theta(x)\in\bits$, this implies $H_\theta(x)=1$.  The case $f(x)=0$ is analogous.  For the hard-to-soft direction, if $H_\theta(x)=1$ then $F_\theta(x)\ge1-\errround>1/2$, and if $H_\theta(x)=0$ then $F_\theta(x)\le\errround<1/2$.
+\end{proof}
+
+\paragraph{Empirical prediction.}
+Decoded failures after soft success should concentrate where at least one of the following is true:
+\[
+    \gammsoft(\theta,f)\text{ is small},
+    \qquad
+    \sum_\ell \alpha_\ell\tau_\ell\prod_{r>\ell}L_r\text{ is large},
+    \qquad
+    \text{categorical margins are small.}
+\]
+This gives a falsifiable diagnostic: plot decoded EM against output margin, categorical tail/margin, and the rounding bound or its empirical proxy.
+
+\section{Distributional decoding: why sampling or beam search can beat local argmax}
+
+Local argmax is not the same as selecting the circuit with the best truth-table loss.  The learned categorical distribution may place nontrivial mass on good circuits even when the coordinatewise mode is poor.
+
+For a circuit $C:\X_B\to\bits$, define full-cube row loss
+\[
+    \loss(C,f)
+    \coloneqq
+    2^{-B}\sum_{x\in\X_B}\one\{C(x)\ne f(x)\}.
+\]
+
+\begin{theorem}[Low distributional risk implies a good sampled circuit]
+\label{thm:sampling-decoder}
+Let $C\sim\Pi_\theta$ and suppose
+\[
+    \E_{C\sim\Pi_\theta}\loss(C,f)\le\epsilon.
+\]
+Then there exists a circuit $C^*$ in the support of $\Pi_\theta$ such that
+\[
+    \loss(C^*,f)\le\epsilon.
+\]
+Moreover, if $C_1,\ldots,C_M\overset{\rm iid}{\sim}\Pi_\theta$ and each is scored on the full truth table, then for every $t>0$,
+\[
+    \Pbb\left\{\min_{m\le M}\loss(C_m,f)>t\right\}
+    \le
+    \left(\frac{\epsilon}{t}\right)^M.
+\]
+In particular, because the smallest nonzero full-cube row loss is $2^{-B}$,
+\[
+    \Pbb\{\text{one sampled circuit is exact}\}
+    \ge
+    1-2^B\epsilon,
+\]
+whenever $2^B\epsilon\le1$, and $M$ independent samples fail to include an exact circuit with probability at most $(2^B\epsilon)^M$.
+\end{theorem}
+
+\begin{proof}
+The existence statement follows because an average cannot be smaller than the minimum over the support.  Markov's inequality gives
+\[
+    \Pbb\{\loss(C,f)>t\}\le \epsilon/t.
+\]
+Independence gives the $M$-sample bound.  For exactness, use
+\[
+    \{\loss(C,f)>0\}=\{\loss(C,f)\ge2^{-B}\}
+\]
+and apply Markov with $t=2^{-B}$.
+\end{proof}
+
+\begin{remark}[Important caveat]
+High soft EM alone does not imply the hypothesis of Theorem~\ref{thm:sampling-decoder}.  The theorem applies to the sampled circuit distribution.  It justifies sampled decoding, beam decoding, or coordinate search when the distributional risk is low or can be made low by training/hardening.  If the implementation wants soft loss to estimate distributional risk, the soft forward must be designed or calibrated so that it tracks $\E_{C\sim\Pi_\theta}\loss(C,f)$ or a valid surrogate.
+\end{remark}
+
+\section{Suggested NeurIPS theory narrative}
+
+\subsection{Main text theorem stack}
+
+A compact main-text theory section could include the following theorem stack.
+\begin{enumerate}[leftmargin=1.4em]
+\item \textbf{Certifiable sampled circuits} (inherited from COLT): for every parameter value, samples are valid Boolean circuits almost surely.
+\item \textbf{Distributional universality} (Theorem~\ref{thm:distributional-universality}): every Boolean function can be sampled with arbitrarily high probability; $O(\log B)$-juntas have polynomial/near-linear templates.
+\item \textbf{Decoded-class learnability} (Theorem~\ref{thm:finite-class-pac}): finite-class PAC bound for hard circuits, clarifying statistical learnability.
+\item \textbf{Soft-to-hard rounding} (Theorem~\ref{thm:rounding}): soft EM transfers to decoded EM under categorical sharpness and output margin.
+\item \textbf{Distributional decoding} (Theorem~\ref{thm:sampling-decoder}): if the learned distribution has low expected truth-table loss, sampling/beam search finds a good discrete circuit with high probability.
+\end{enumerate}
+
+\subsection{Claims to avoid}
+
+The revised paper should avoid saying that the observed soft EM is itself a certified reasoning score.  A safer phrasing is:
+\begin{quote}
+\emph{The soft relaxation is an optimization surrogate.  Circuit-level certification applies to sampled or decoded circuits.  We therefore report soft EM, decoded EM, and their gap separately.  The gap is predicted by our rounding theorem and can be reduced by entropy/margin regularization, hardening, and loss-aware decoding.}
+\end{quote}
+
+\subsection{Diagnostics implied by the theory}
+
+For every trained instance, log the following:
+\begin{enumerate}[leftmargin=1.4em]
+\item soft EM and decoded EM;
+\item soft row accuracy and decoded row accuracy;
+\item $\gammsoft(\theta,f)=\min_x(2f(x)-1)(F_\theta(x)-1/2)$;
+\item categorical tail and margin, separately for gates, pair selectors, mixers, and lifting/readout;
+\item entropy of each categorical distribution;
+\item the empirical proxy for $\errround(\theta)$;
+\item local argmax decoded EM versus sampled/beam/coordinate-decoded EM.
+\end{enumerate}
+
+The key plot is decoded EM as a function of output margin and categorical sharpness.  The theory predicts that high soft EM with low decoded EM should occur when soft margins are small or selectors remain diffuse.
+
+\section{Drop-in paragraph for the paper}
+
+\begin{quote}
+\emph{The differentiable \SBC{} used during training has two distinct semantics.  Sampling its categorical gates and routes gives a genuine Boolean circuit, and our universality theorem applies to this discrete distribution.  Replacing these categorical variables by soft mixtures gives a continuous relaxation used for gradient-based optimization.  These semantics need not agree: a convex mixture of locally incorrect gates may threshold to the correct truth table, while local argmax decoding selects an incorrect circuit.  We therefore introduce the relaxation-to-circuit gap and prove a margin-based rounding theorem.  If the soft predictor is correct with output margin exceeding the accumulated categorical tail mass, then local decoding is also correct.  Conversely, decoded correctness plus small rounding error certifies soft correctness.  This explains why soft EM can substantially exceed decoded EM and motivates reporting both metrics, as well as using hardening, sampled decoding, and loss-aware coordinate search.}
+\end{quote}
+
+\section{Minimal notation block for integration}
+
+If space is tight, the following notation is sufficient for the NeurIPS main text:
+\[
+\begin{gathered}
+\SoftEM=\one\{\tau(F_\theta)=f\text{ on }\X_B\},\qquad
+\DecEM=\one\{H_\theta=f\text{ on }\X_B\},\\
+\gammsoft=\min_x(2f(x)-1)(F_\theta(x)-1/2),\qquad
+\tail(p)=1-\max_i p_i.
+\end{gathered}
+\]
+Then state the rounding theorem in the simplified site-level form
+\[
+    \sup_x |F_\theta(x)-H_\theta(x)|
+    \le
+    \sum_{s=1}^M \Lambda_sD_s\tail(p_s)
+    \eqqcolon \errround(\theta),
+\]
+so that $\gammsoft>\errround$ implies decoded exact match.
+
+\section{Proof details for the site-level rounding bound}
+
+For completeness, here is the site-level variant most convenient for appendices.  Suppose a forward computation is a composition of modules and each categorical site $s$ replaces a convex combination
+\[
+    M_{s,p_s}(u)=\sum_{i=1}^{K_s}p_{s,i}M_{s,i}(u)
+\]
+by the local winner $M_{s,i_s^+}$.  If
+\[
+    \sup_u \norm{M_{s,i}(u)-M_{s,i_s^+}(u)}_\infty\le D_s
+    \qquad\forall i,
+\]
+then at fixed input
+\[
+\begin{aligned}
+\norm{M_{s,p_s}(u)-M_{s,i_s^+}(u)}_\infty
+&=\norm{\sum_i p_{s,i}\big(M_{s,i}(u)-M_{s,i_s^+}(u)\big)}_\infty\\
+&\le \sum_{i\ne i_s^+}p_{s,i}D_s
+= D_s\tail(p_s).
+\end{aligned}
+\]
+If a perturbation introduced at site $s$ is amplified by at most $\Lambda_s$ by the downstream computation, summing over sites gives
+\[
+    \sup_x|F_\theta(x)-H_\theta(x)|
+    \le
+    \sum_s \Lambda_sD_s\tail(p_s).
+\]
+This is the form that can be estimated empirically by using conservative constants $D_s\le1$ for scalar bounded gates and approximate downstream Lipschitz constants.
+
+\section{Practical consequence for the reported 97\% soft EM}
+
+If the current runs show roughly $97\%$ soft EM but much lower decoded EM, the mathematically clean explanation is:
+\begin{enumerate}[leftmargin=1.4em]
+\item The soft relaxation can solve truth tables by using graded mixtures of primitives.
+\item Local argmax discards the mixture and keeps only one option per categorical site.
+\item Unless the categorical distributions are sharp enough relative to the truth-table output margin, Theorem~\ref{thm:rounding} gives no reason for decoded EM to match soft EM.
+\item Therefore the old experimental setup should be reframed: soft EM measures optimization of the relaxation; decoded EM measures certified circuit recovery.
+\end{enumerate}
+
+A strong NeurIPS revision can make this a feature rather than a weakness: the paper identifies, quantifies, and theoretically explains the relaxation-to-circuit gap, then evaluates methods that reduce it.
+
+\end{document}

@@ -50,16 +50,20 @@ DEFAULT_CFG: Dict[str, Any] = {
     "use_row_L": True,
     "use_max_L": False,
 
-    # NEW: dataset-driven scaling for S and L (with parameter k)
-    # S_used = { identity(S_base), S_base + k, S_base * k }
-    # L_used = { identity(L_base), L_base + k, L_base * k }
+    # Dataset-driven scaling for width/depth (legacy names: S/L).
+    # W_model/S_used = { identity(W_base), W_base + k, W_base * k }
+    # D_model/L_used = { identity(D_base), D_base + k, D_base * k }
+    # Set W_base_field/D_base_field to "W_true"/"D_true" to size from the
+    # reduced-expression circuit stats instead of generator budget proxies.
     "scale": {
         "use_row_S": True,     # if dataset row has "S", use it as base; else cfg["S"]
+        "W_base_field": "S",   # "S"/"W_base" for proxy width, or "W_true"
         "S_op": "identity",    # "identity" | "add" | "mul"
         "S_k": 2,              # used only if op != identity
         "S_min": 2,
         "S_max": 64,
 
+        "D_base_field": "L",   # "L"/"D_base" for proxy depth, or "D_true"
         "L_op": "identity",    # "identity" | "add" | "mul"
         "L_k": 1,              # used only if op != identity
         "L_min": 2,
@@ -128,6 +132,12 @@ def configure_torch_threads_from_env() -> None:
             n = max(1, int(raw))
             torch.set_num_threads(n)
         except Exception:
+            pass
+    interop = os.environ.get("UBC_TORCH_INTEROP_THREADS")
+    if interop:
+        try:
+            torch.set_num_interop_threads(max(1, int(interop)))
+        except RuntimeError:
             pass
     print(f"[info] torch_num_threads={torch.get_num_threads()}")
 
@@ -354,24 +364,42 @@ def _clamp_int(x: int, lo: int | None, hi: int | None) -> int:
     return y
 
 
+def _row_int(inst: Dict[str, Any], field: str, fallback_fields: Tuple[str, ...]) -> Optional[int]:
+    for key in (field, *fallback_fields):
+        if key in inst:
+            return int(inst[key])
+    return None
+
+
 def resolve_S_L_used(cfg: Dict[str, Any], inst: Dict[str, Any], L_override: Optional[int]) -> Tuple[int, int, int, int]:
     """
-    Returns: (S_base, L_base, S_used, L_used)
-    where base comes from dataset row (if enabled) and used comes after scaling + clamp.
+    Returns: (S_base, L_base, S_used, L_used).
+
+    Legacy S/L names correspond to paper-facing W/D:
+      S_base/S_used = W_base/W_model
+      L_base/L_used = D_base/D_model
+
+    By default we preserve old behavior and use row fields S/L. New datasets
+    also expose W_base/D_base and W_true/D_true, so experiments can choose e.g.
+    scale.W_base_field=W_true and scale.D_base_field=D_true.
     """
     scale = cfg.get("scale", {}) or {}
+    W_base_field = str(scale.get("W_base_field", scale.get("S_base_field", "S")))
+    D_base_field = str(scale.get("D_base_field", scale.get("L_base_field", "L")))
 
     # ----- Base L -----
     if L_override is not None:
         L_base = int(L_override)
-    elif bool(cfg.get("use_row_L", True)) and ("L" in inst):
-        L_base = int(inst["L"])
+    elif bool(cfg.get("use_row_L", True)):
+        row_L = _row_int(inst, D_base_field, ("L", "D_base"))
+        L_base = row_L if row_L is not None else int(cfg["L"])
     else:
         L_base = int(cfg["L"])
 
     # ----- Base S -----
-    if bool(scale.get("use_row_S", True)) and ("S" in inst):
-        S_base = int(inst["S"])
+    if bool(scale.get("use_row_S", True)):
+        row_S = _row_int(inst, W_base_field, ("S", "W_base"))
+        S_base = row_S if row_S is not None else int(cfg["S"])
     else:
         S_base = int(cfg["S"])
 
@@ -627,6 +655,8 @@ def train_single_instance(
         "B": B,
         "S_base": S_base, "L_base": L_base,
         "S_used": S_used, "L_used": L_used,
+        "W_base": S_base, "D_base": L_base,
+        "W_model": S_used, "D_model": L_used,
         "row_acc": row_acc, "em": em,
         "decoded_row_acc": decoded_row_acc, "decoded_em": decoded_em,
         "formula": formula,
@@ -640,6 +670,7 @@ def train_single_instance(
 
 # ---------- Dataset runner ----------
 def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
+    configure_torch_threads_from_env()
     device = _device(cfg)
     seed_all(cfg["seed"])
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -657,7 +688,12 @@ def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
         "max" if cfg.get("use_max_L", False) else "fixed"
     )
     if l_strategy == "max":
-        global_L = max(int(inst.get("L", cfg["L"])) for inst in insts)
+        scale = cfg.get("scale", {}) or {}
+        D_base_field = str(scale.get("D_base_field", scale.get("L_base_field", "L")))
+        global_L = max(
+            _row_int(inst, D_base_field, ("L", "D_base")) or int(cfg["L"])
+            for inst in insts
+        )
         print(f"[info] Using max L across dataset: L_max = {global_L}")
 
     results = []
@@ -666,9 +702,7 @@ def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
         for idx, inst in enumerate(insts):
             seed_all(stable_seed(int(cfg["seed"]), "ubc", idx))
             L_override = None
-            if l_strategy == "row" and ("L" in inst):
-                L_override = int(inst["L"])
-            elif l_strategy == "max":
+            if l_strategy == "max":
                 L_override = int(global_L)
 
             res = train_single_instance(device, cfg, inst, L_override=L_override)
@@ -717,6 +751,7 @@ def run_dataset(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
 
 # ---------- Single-task fallback ----------
 def run_single(cfg: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
+    configure_torch_threads_from_env()
     device = _device(cfg)
     seed_all(cfg["seed"])
 
@@ -851,7 +886,6 @@ def parse_args():
 
 def main():
     args = parse_args()
-    configure_torch_threads_from_env()
     cfg = load_config(args.config)
     if args.dataset is not None:
         cfg["dataset"] = args.dataset

@@ -189,6 +189,13 @@ def apply_scale(val: int, op: str, k: int, vmin: int, vmax: int) -> int:
     return int(max(vmin, min(vmax, out)))
 
 
+def row_int(inst: Dict[str, Any], field: str, fallbacks: Tuple[str, ...], default: int) -> int:
+    for key in (field, *fallbacks):
+        if key in inst:
+            return int(inst[key])
+    return int(default)
+
+
 # -----------------------------
 # UBC decode
 # -----------------------------
@@ -771,8 +778,8 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
 
     for idx, inst in enumerate(insts):
         B = int(inst["B"])
-        S_base = int(inst["S"])
-        L_base = int(inst.get("L", cfg.get("L", 2)))
+        S_base = row_int(inst, args.W_base_field, ("S", "W_base"), int(cfg.get("S", 2)))
+        L_base = row_int(inst, args.D_base_field, ("L", "D_base"), int(cfg.get("L", 2)))
 
         S_used = apply_scale(S_base, args.S_op, args.S_k, args.S_min, args.S_max)
         L_used = apply_scale(L_base, args.L_op, args.L_k, args.L_min, args.L_max)
@@ -815,8 +822,14 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
         row = {
             "idx": idx,
             "B": B,
+            "S_base": S_base,
             "S_used": S_used,
+            "L_base": L_base,
             "L_used": L_used,
+            "W_base": S_base,
+            "W_model": S_used,
+            "D_base": L_base,
+            "D_model": L_used,
             "label_expr": label_expr,
             "ubc": {
                 "em": ubc.em,
@@ -885,6 +898,12 @@ def run(cfg: Dict[str, Any], out_dir: Path, args) -> Dict[str, Any]:
     summary = {
         "config": cfg,
         "mlp_match": args.mlp_match,
+        "scale": {
+            "W_base_field": args.W_base_field,
+            "D_base_field": args.D_base_field,
+            "S_op": args.S_op, "S_k": args.S_k, "S_min": args.S_min, "S_max": args.S_max,
+            "L_op": args.L_op, "L_k": args.L_k, "L_min": args.L_min, "L_max": args.L_max,
+        },
         "means": {
             "ubc_em_rate": float(sum(agg["ubc_em"]) / n),
             "mlp_em_rate": float(sum(agg["mlp_em"]) / n),
@@ -914,11 +933,15 @@ def parse_args():
     ap.add_argument("--mlp_match", type=str, default="neuron",
                     choices=["neuron", "param_soft", "param_total"])
 
+    ap.add_argument("--W_base_field", type=str, default="S",
+                    help="Dataset field used as model width base, e.g. S, W_base, or W_true.")
     ap.add_argument("--S_op", type=str, default="none", choices=["none","add","mul"])
     ap.add_argument("--S_k", type=int, default=0)
     ap.add_argument("--S_min", type=int, default=2)
     ap.add_argument("--S_max", type=int, default=128)
 
+    ap.add_argument("--D_base_field", type=str, default="L",
+                    help="Dataset field used as model depth base, e.g. L, D_base, or D_true.")
     ap.add_argument("--L_op", type=str, default="none", choices=["none","add","mul"])
     ap.add_argument("--L_k", type=int, default=0)
     ap.add_argument("--L_min", type=int, default=2)
