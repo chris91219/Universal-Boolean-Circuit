@@ -1,0 +1,232 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+
+\newcommand{\SBC}{\textsc{SBC}}
+\newcommand{\MLP}{\textsc{MLP}}
+\newcommand{\TT}{\mathrm{TT}}
+\newcommand{\SoftEM}{\mathrm{SoftEM}}
+\newcommand{\DecEM}{\mathrm{DecodedEM}}
+\newcommand{\BNR}{\mathrm{BNR}}
+\newcommand{\Cat}{\mathrm{Cat}}
+\newcommand{\Wadd}{W_{\mathrm{add}}}
+\newcommand{\Sadd}{S_{\mathrm{add}}}
+
+\title{Main-Text Empirical Plan: SBC as a Soft Mixture of Boolean Circuits}
+\author{Internal NeurIPS resubmission notes}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+
+\section{Narrative Decision}
+
+The main empirical story should be:
+\[
+  \text{\SBC{} is an explicit differentiable relaxation of a finite Boolean-circuit family,}
+\]
+and on the new larger truth-table benchmark this structural prior should give higher soft exact-match than parameter-matched \MLP{} baselines.
+
+The decode-gap, noise-variable robustness, Gumbel/STE jumps, and hard-circuit recovery story should move mostly to appendix.  They remain important, but the deadline-friendly main-text claim is softer and cleaner:
+\[
+  \text{soft circuit mixtures can be useful even before we fully solve hard circuit recovery.}
+\]
+
+\section{What ``Soft Mixture of Boolean Circuits'' Means}
+
+At each \SBC{} layer, each unit has categorical gate weights and categorical wiring/readout weights.  Abstractly, for unit \(s\) in layer \(\ell\),
+\[
+  h_{\ell,s}(x)
+  =
+  \sum_{g \in \mathcal G}
+  \pi_{\ell,s,g}\,
+  \sigma_g
+  \left(
+    \sum_i \alpha_{\ell,s,i} h_{\ell-1,i}(x),
+    \sum_j \beta_{\ell,s,j} h_{\ell-1,j}(x)
+  \right),
+\]
+where \(\mathcal G\) is the finite Boolean gate set, and
+\[
+  \pi_{\ell,s}\in \Delta^{|\mathcal G|-1},
+  \qquad
+  \alpha_{\ell,s},\beta_{\ell,s}\in \Delta^{m_{\ell-1}-1}.
+\]
+The layer readout is also categorical/convex:
+\[
+  z_{\ell,k}(x) = \sum_s \rho_{\ell,k,s} h_{\ell,s}(x),
+  \qquad
+  \rho_{\ell,k}\in \Delta^{S-1}.
+\]
+
+Thus the learned object is not just an arbitrary real-valued network.  It is a product of local categorical choices over:
+\[
+  \text{wires} \times \text{Boolean gates} \times \text{readout wires}.
+\]
+Local argmax decoding selects one discrete circuit from this relaxed family.  The soft forward pass keeps the convex/categorical relaxation.
+
+\paragraph{Important caveat.}
+We should avoid claiming that the current soft forward pass is exactly the expectation of a sampled hard circuit in all settings.  Because downstream Boolean primitives are evaluated on relaxed inputs, the computation is best described as a finite categorical \emph{circuit relaxation}.  In the low-temperature / high-margin regime, this relaxation approaches a distribution over hard circuits, and argmax decoding becomes a meaningful rounding map.
+
+\section{Why an MLP Is Not the Same Object}
+
+A parameter-matched \MLP{} can fit a truth table, but it does not provide:
+\begin{itemize}[leftmargin=1.5em]
+  \item categorical variables over gates;
+  \item categorical variables over wires;
+  \item a natural hard circuit obtained by local argmax;
+  \item a layerwise finite circuit family whose choices can be inspected.
+\end{itemize}
+
+So the comparison should not be: ``Can an \MLP{} fit the same labels?''  It should be:
+\[
+  \text{Does the model fit the truth table while remaining close to Boolean-circuit semantics?}
+\]
+
+\section{Quantifying the Difference}
+
+\subsection{SBC-side diagnostics}
+
+For \SBC{}, we can directly report categorical concentration:
+\[
+  H(\pi),\quad \max_g \pi_g,\quad
+  \pi_{(1)}-\pi_{(2)}
+\]
+for gate, row-readout, and pair-selector distributions.  These are already emitted as diagnostics:
+\[
+  \texttt{gate\_entropy\_mean},\quad
+  \texttt{gate\_max\_prob\_mean},\quad
+  \texttt{gate\_margin\_mean},
+\]
+and similarly for \texttt{row} and \texttt{pair}.
+
+Interpretation:
+\[
+  \text{low entropy / high max-prob / high margin}
+  \quad\Rightarrow\quad
+  \text{near a small set of discrete circuits}.
+\]
+
+\subsection{MLP-side diagnostics}
+
+For an \MLP{}, we measure whether hidden units look Boolean over the full truth table.  For hidden unit \(j\) in layer \(\ell\), let
+\[
+  A_{\ell,j} = \{ h_{\ell,j}(x) : x \in \{0,1\}^B \}.
+\]
+Define exact Boolean-neuron rate:
+\[
+  \BNR_{\mathrm{exact}}(\ell)
+  =
+  \frac{1}{H_\ell}
+  \sum_{j=1}^{H_\ell}
+  \mathbf{1}\{ |\mathrm{round}(A_{\ell,j})| \le 2 \}.
+\]
+Define \(\epsilon\)-Boolean-neuron rate by checking whether each activation vector is within \(\epsilon\) of two cluster centers:
+\[
+  \BNR_{\epsilon}(\ell)
+  =
+  \frac{1}{H_\ell}
+  \sum_{j=1}^{H_\ell}
+  \mathbf{1}\{
+    \exists c_0,c_1
+    \text{ such that }
+    \max_x \min(|h_{\ell,j}(x)-c_0|, |h_{\ell,j}(x)-c_1|)
+    \le \epsilon
+  \}.
+\]
+
+The MLP-only runner now records:
+\[
+\begin{aligned}
+  &\texttt{mlp\_bnr\_exact\_L1},\quad
+   \texttt{mlp\_bnr\_eps\_L1},\\
+  &\texttt{mlp\_bnr\_exact\_avg},\quad
+   \texttt{mlp\_bnr\_eps\_avg},\\
+  &\texttt{mlp\_unique\_norm\_avg}.
+\end{aligned}
+\]
+
+Interpretation:
+\[
+  \text{low MLP BNR despite high MLP EM}
+  \quad\Rightarrow\quad
+  \text{truth-table fit without Boolean-circuit-like hidden semantics}.
+\]
+
+\section{Main Experiment}
+
+Dataset:
+\[
+  \texttt{bench\_small\_b10\_2000\_noise\_add0.jsonl}
+\]
+or its equivalent no-noise 2000-row version.  This contains \(400\) rows each for
+\[
+  B \in \{2,4,6,8,10\}.
+\]
+
+Grid:
+\[
+  \Sadd \in \{10,12,14,16,18\},
+  \qquad
+  \text{seeds } 1,\dots,5.
+\]
+
+Models:
+\[
+  \SBC,
+  \qquad
+  \MLP_{\mathrm{neuron}},
+  \qquad
+  \MLP_{\mathrm{param\_soft}},
+  \qquad
+  \MLP_{\mathrm{param\_total}}.
+\]
+
+Primary table:
+\[
+\begin{array}{lcccc}
+\toprule
+\text{Model} & \Sadd & \text{Params} & \SoftEM & \text{Diagnostic} \\
+\midrule
+\SBC & 10,12,14,16,18 & \cdots & \cdots & \text{gate/row/pair entropy} \\
+\MLP_{\mathrm{neuron}} & 10,12,14,16,18 & \cdots & \cdots & \BNR \\
+\MLP_{\mathrm{param\_soft}} & 10,12,14,16,18 & \cdots & \cdots & \BNR \\
+\MLP_{\mathrm{param\_total}} & 10,12,14,16,18 & \cdots & \cdots & \BNR \\
+\bottomrule
+\end{array}
+\]
+
+Desired main-text signal:
+\[
+  \SoftEM(\SBC) > \SoftEM(\MLP_{\mathrm{param\_soft/total}})
+  \quad\text{and}\quad
+  \BNR(\MLP)\ \text{is low}.
+\]
+
+\section{Implementation Status}
+
+\begin{itemize}[leftmargin=1.5em]
+  \item New Slurm: \texttt{scripts/submit\_main\_softmix\_sweep\_cc.sh}.
+  \item New MLP diagnostics: \texttt{src/ubcircuit/mlp\_only.py} records BNR metrics when called with \texttt{--diagnostics}.
+  \item New collator: \texttt{scripts/analyze\_main\_softmix\_sweep.py}.
+  \item Rclone filter now includes \texttt{/main\_softmix\_sweep/**} and \texttt{ubc\_main\_softmix*.out}.
+\end{itemize}
+
+\section{Appendix Placement}
+
+The following are still useful, but should not dominate the main story:
+\begin{itemize}[leftmargin=1.5em]
+  \item decoded EM and relaxation-to-circuit gap;
+  \item \(W_{\mathrm{true}}/D_{\mathrm{true}}\) experiments;
+  \item noise-variable robustness slopes;
+  \item Gumbel/STE and warm-start jump experiments;
+  \item rounding-margin and low-expected-loss existence statements.
+\end{itemize}
+
+They support the broader thesis: learning discrete circuits by gradient descent is hard, but the \SBC{} relaxation gives a principled and inspectable search space.
+
+\end{document}

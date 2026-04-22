@@ -48,8 +48,18 @@ class TruthTableMLP(nn.Module):
         layers.append(nn.Linear(last, 1))
         self.net = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(self.net(x))
+    def forward(self, x: torch.Tensor, return_acts: bool = False):
+        if not return_acts:
+            return torch.sigmoid(self.net(x))
+
+        acts: List[torch.Tensor] = []
+        h = x
+        for layer in self.net[:-1]:
+            h = layer(h)
+            if isinstance(layer, nn.ReLU):
+                acts.append(h)
+        y = torch.sigmoid(self.net[-1](h))
+        return y, acts
 
 
 def configure_torch_threads() -> None:
@@ -154,6 +164,103 @@ def eval_model(model: nn.Module, X: torch.Tensor, y_true: torch.Tensor, batch_si
             preds.append(model(X[start:start + batch_size]))
         y_pred = torch.cat(preds, dim=0)
     return per_instance_metrics(y_true, y_pred)
+
+
+def _round_tensor(x: torch.Tensor, decimals: int) -> torch.Tensor:
+    if decimals <= 0:
+        return torch.round(x)
+    scale = 10.0 ** decimals
+    return torch.round(x * scale) / scale
+
+
+def bnr_exact_fraction(layer_act: torch.Tensor, decimals: int = 6) -> float:
+    """Fraction of units whose full-truth-table activations have <=2 levels."""
+    A = _round_tensor(layer_act.detach().cpu(), decimals=decimals)
+    if A.numel() == 0:
+        return 0.0
+    _, H = A.shape
+    ok = 0
+    for j in range(H):
+        if torch.unique(A[:, j]).numel() <= 2:
+            ok += 1
+    return float(ok / max(1, H))
+
+
+def bnr_eps_fraction(layer_act: torch.Tensor, eps: float = 1e-3) -> float:
+    """Two-cluster Boolean-neuron-rate proxy with tolerance eps."""
+    A = layer_act.detach().cpu().float()
+    if A.numel() == 0:
+        return 0.0
+    _, H = A.shape
+    ok = 0
+    for j in range(H):
+        v = A[:, j]
+        med = torch.median(v)
+        lo = v[v <= med]
+        hi = v[v > med]
+        if lo.numel() == 0 or hi.numel() == 0:
+            ok += 1
+            continue
+        c0 = torch.median(lo)
+        c1 = torch.median(hi)
+        dist = torch.minimum((v - c0).abs(), (v - c1).abs()).max().item()
+        if dist <= eps:
+            ok += 1
+    return float(ok / max(1, H))
+
+
+def activation_level_stats(layer_act: torch.Tensor, decimals: int = 6) -> Dict[str, float]:
+    """Cheap summary of how many distinct activation levels each hidden unit uses."""
+    A = _round_tensor(layer_act.detach().cpu(), decimals=decimals)
+    if A.numel() == 0:
+        return {"unique_mean": 0.0, "unique_median": 0.0, "unique_norm_mean": 0.0}
+    N, H = A.shape
+    counts = torch.tensor([torch.unique(A[:, j]).numel() for j in range(H)], dtype=torch.float32)
+    return {
+        "unique_mean": float(counts.mean().item()),
+        "unique_median": float(counts.median().item()),
+        "unique_norm_mean": float((counts / max(1, N)).mean().item()),
+    }
+
+
+def mlp_activation_diagnostics(
+    model: nn.Module,
+    X: torch.Tensor,
+    *,
+    max_B: int,
+    decimals: int = 6,
+    eps: float = 1e-3,
+) -> Dict[str, Any]:
+    """BNR diagnostics for asking whether an MLP learned Boolean-like hidden units."""
+    B = int(X.shape[1])
+    if B > int(max_B):
+        return {
+            "mlp_diag_skipped": 1,
+            "mlp_diag_skip_reason": f"B={B} exceeds diagnostics_max_B={max_B}",
+        }
+
+    with torch.no_grad():
+        _y_pred, acts = model(X, return_acts=True)
+
+    bnr_exact = [bnr_exact_fraction(a, decimals=decimals) for a in acts]
+    bnr_eps = [bnr_eps_fraction(a, eps=eps) for a in acts]
+    level_stats = [activation_level_stats(a, decimals=decimals) for a in acts]
+    unique_norm = [float(s["unique_norm_mean"]) for s in level_stats]
+
+    def avg(xs: List[float]) -> float:
+        return float(sum(xs) / max(1, len(xs)))
+
+    return {
+        "mlp_diag_skipped": 0,
+        "mlp_bnr_exact_per_layer": bnr_exact,
+        "mlp_bnr_eps_per_layer": bnr_eps,
+        "mlp_activation_level_stats": level_stats,
+        "mlp_bnr_exact_L1": float(bnr_exact[0]) if bnr_exact else 0.0,
+        "mlp_bnr_eps_L1": float(bnr_eps[0]) if bnr_eps else 0.0,
+        "mlp_bnr_exact_avg": avg(bnr_exact),
+        "mlp_bnr_eps_avg": avg(bnr_eps),
+        "mlp_unique_norm_avg": avg(unique_norm),
+    }
 
 
 def train_one(
@@ -263,6 +370,16 @@ def train_one(
     with torch.no_grad():
         row_acc, em = eval_model(model, X, y_true, batch_size=int(args.eval_batch_size))
 
+    diagnostics: Dict[str, Any] = {}
+    if bool(args.diagnostics):
+        diagnostics = mlp_activation_diagnostics(
+            model,
+            X,
+            max_B=int(args.diagnostics_max_B),
+            decimals=int(args.bnr_decimals),
+            eps=float(args.bnr_eps),
+        )
+
     return {
         "idx": idx,
         "B": B,
@@ -287,6 +404,12 @@ def train_one(
         "row_acc": float(row_acc),
         "em": int(em),
         "train_steps": int(train_steps),
+        "diagnostics": diagnostics,
+        "mlp_bnr_exact_L1": diagnostics.get("mlp_bnr_exact_L1"),
+        "mlp_bnr_eps_L1": diagnostics.get("mlp_bnr_eps_L1"),
+        "mlp_bnr_exact_avg": diagnostics.get("mlp_bnr_exact_avg"),
+        "mlp_bnr_eps_avg": diagnostics.get("mlp_bnr_eps_avg"),
+        "mlp_unique_norm_avg": diagnostics.get("mlp_unique_norm_avg"),
         "formula": formula,
         "label_expr": normalize_expr(formula),
     }
@@ -348,6 +471,17 @@ def run(cfg: Dict[str, Any], out_dir: Path, args: argparse.Namespace) -> Dict[st
         },
         "results_jsonl": str(results_path),
     }
+    diag_mean_keys = [
+        "mlp_bnr_exact_L1",
+        "mlp_bnr_eps_L1",
+        "mlp_bnr_exact_avg",
+        "mlp_bnr_eps_avg",
+        "mlp_unique_norm_avg",
+    ]
+    for key in diag_mean_keys:
+        vals = [float(r[key]) for r in results if isinstance(r.get(key), (int, float))]
+        if vals:
+            summary["means"][key] = float(sum(vals) / len(vals))
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     print(f"[ok] wrote {out_dir / 'summary.json'}")
     return summary
@@ -375,6 +509,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--eval_batch_size", type=int, default=0,
                     help="0 means full truth-table eval in one pass; positive chunks eval.")
     ap.add_argument("--max_B", type=int, default=None)
+    ap.add_argument("--diagnostics", action="store_true",
+                    help="Record MLP activation BNR diagnostics after training.")
+    ap.add_argument("--diagnostics_max_B", type=int, default=12,
+                    help="Skip activation diagnostics above this B to avoid huge truth-table passes.")
+    ap.add_argument("--bnr_decimals", type=int, default=6)
+    ap.add_argument("--bnr_eps", type=float, default=1.0e-3)
     return ap.parse_args()
 
 

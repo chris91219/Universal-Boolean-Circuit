@@ -160,7 +160,16 @@
 + /robustness_sbc_jump/**/*.csv
 + /robustness_sbc_jump/**/*.yaml
 + /robustness_sbc_jump/**/*.yml
-+
+
+# ---- Main NeurIPS soft-mixture sweep ----
++ /main_softmix_sweep/
++ /main_softmix_sweep/**/
++ /main_softmix_sweep/**/*.json
++ /main_softmix_sweep/**/*.jsonl
++ /main_softmix_sweep/**/*.csv
++ /main_softmix_sweep/**/*.yaml
++ /main_softmix_sweep/**/*.yml
+
 # ---- Current benchmark Slurm logs ----
 + /slurm-logs/
 + /slurm-logs/ubc_best_*.out
@@ -171,6 +180,7 @@
 + /slurm-logs/ubc_robust_mlp*.out
 + /slurm-logs/ubc_robust_sbc*.out
 + /slurm-logs/ubc_robust_jump*.out
++ /slurm-logs/ubc_main_softmix*.out
 
 # ---- Exclude everything else ----
 - **
