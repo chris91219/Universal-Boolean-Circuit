@@ -21,7 +21,7 @@
 
 #SBATCH --job-name=ubc_main_softmix
 #SBATCH --account=def-ssanner
-#SBATCH --time=1-12:00:00
+#SBATCH --time=2-00:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --array=0-99
