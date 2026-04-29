@@ -30,6 +30,14 @@
 + /bench_default_best_joint_1216/**/*.yaml
 + /bench_default_best_joint_1216/**/*.yml
 
++ /bench_default_b1416_joint_1216/
++ /bench_default_b1416_joint_1216/**/
++ /bench_default_b1416_joint_1216/**/*.json
++ /bench_default_b1416_joint_1216/**/*.jsonl
++ /bench_default_b1416_joint_1216/**/*.csv
++ /bench_default_b1416_joint_1216/**/*.yaml
++ /bench_default_b1416_joint_1216/**/*.yml
+
 + /bench_default_best_analysis/
 + /bench_default_best_analysis/**/
 + /bench_default_best_analysis/**/*.json
@@ -181,6 +189,7 @@
 + /slurm-logs/ubc_robust_sbc*.out
 + /slurm-logs/ubc_robust_jump*.out
 + /slurm-logs/ubc_main_softmix*.out
++ /slurm-logs/ubc_b1416_joint*.out
 
 # ---- Exclude everything else ----
 - **

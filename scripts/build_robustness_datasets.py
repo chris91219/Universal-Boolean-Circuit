@@ -301,6 +301,36 @@ def build_fresh(Bs: Sequence[int], n_per_B: int, seed: int) -> List[Dict[str, An
     return out
 
 
+def build_append_only_rows(
+    extended_rows: List[Dict[str, Any]],
+    *,
+    base_rows: int,
+    append_Bs: Sequence[int],
+) -> List[Dict[str, Any]]:
+    """Extract only the appended high-B rows from a combined extended dataset.
+
+    The combined dataset keeps original bench_default rows first, so the new
+    appended rows start at ``base_rows``.  For the append-only shard we preserve
+    the original combined index in ``combined_dataset_idx`` and renumber the
+    local ``dataset_idx`` from 0..N-1 for cleaner standalone runs.
+    """
+    allowed_B = {int(b) for b in append_Bs}
+    out: List[Dict[str, Any]] = []
+    for row in extended_rows:
+        src = str(row.get("source", ""))
+        if not src.startswith("generated_B"):
+            continue
+        if int(row.get("B", -1)) not in allowed_B:
+            continue
+        new_row = dict(row)
+        new_row["combined_dataset_idx"] = int(row.get("dataset_idx", -1))
+        new_row["combined_base_rows"] = int(base_rows)
+        out.append(new_row)
+    for idx, row in enumerate(out):
+        row["dataset_idx"] = idx
+    return out
+
+
 def make_noise_rows(base_rows: List[Dict[str, Any]], noise_add: int, noise_basis: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     noise_basis = str(noise_basis)
@@ -359,6 +389,7 @@ def main() -> None:
     ap.add_argument("--mode", choices=["extend", "fresh"], default="extend")
     ap.add_argument("--base", type=Path, default=Path("data/bench_default.jsonl"))
     ap.add_argument("--extended-out", type=Path, default=Path("data/bench_default_ext_b20.jsonl"))
+    ap.add_argument("--append-only-out", type=Path, default=None)
     ap.add_argument("--append-B", default="14,16,18,20")
     ap.add_argument("--fresh-B", default="2,4,6,8,10")
     ap.add_argument("--n-per-B", type=int, default=200)
@@ -416,6 +447,44 @@ def main() -> None:
             },
         )
         print(f"[ok] wrote {len(extended)} rows -> {args.extended_out}")
+
+        if args.append_only_out is not None:
+            if args.mode != "extend":
+                raise ValueError("--append-only-out is only supported in --mode extend")
+            append_only = build_append_only_rows(
+                extended,
+                base_rows=len(base_rows),
+                append_Bs=append_Bs,
+            )
+            write_jsonl(args.append_only_out, append_only)
+            write_meta(
+                args.append_only_out.with_suffix(args.append_only_out.suffix + ".meta.json"),
+                {
+                    "kind": "extended_high_B_append_only",
+                    "append_only_out": str(args.append_only_out),
+                    "source_combined": str(args.extended_out),
+                    "base": str(args.base),
+                    "base_rows": len(base_rows),
+                    "append_B": append_Bs,
+                    "n_per_B": args.n_per_B,
+                    "seed": args.seed,
+                    "total_rows": len(append_only),
+                    "truth_table_formula_field": "formula",
+                    "reduced_expr_is_metadata_only": True,
+                    "ambient_dimension_field": "B",
+                    "junta_size_field": "B_true",
+                    "base_width_field": "W_base",
+                    "base_depth_field": "D_base",
+                    "legacy_base_width_alias": "S",
+                    "legacy_base_depth_alias": "L",
+                    "true_depth_field": "D_true",
+                    "legacy_depth_alias": "L_true",
+                    "legacy_heuristic_depth_field": "L_true_heuristic",
+                    "true_width_field": "W_true",
+                    "true_depth_width_method": "balanced_dnf_fanin2_with_projection_carries",
+                },
+            )
+            print(f"[ok] wrote {len(append_only)} rows -> {args.append_only_out}")
 
     if not args.skip_noise:
         if extended is None:
