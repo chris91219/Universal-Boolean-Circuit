@@ -58,21 +58,40 @@ def numeric_mean_fields(summary: Dict[str, Any]) -> Dict[str, float]:
     return out
 
 
-def collect_runs(root: Path) -> Dict[Tuple[str, int], Dict[str, Any]]:
-    table: Dict[Tuple[str, int], Dict[str, Any]] = {}
+def early_stop_metric(summary: Dict[str, Any]) -> str | None:
+    cfg = summary.get("config") or {}
+    if not isinstance(cfg, dict):
+        return None
+    early = cfg.get("early_stop") or {}
+    if not isinstance(early, dict):
+        return None
+    metric = early.get("metric")
+    return str(metric) if metric is not None else None
+
+
+def collect_runs(root: Path, *, require_metric: str | None = None) -> Dict[Tuple[str, int], Dict[str, Any]]:
+    grouped: Dict[Tuple[str, int], list[Dict[str, Any]]] = {}
     for run_dir in find_run_dirs(root):
         summary = json.loads((run_dir / "summary.json").read_text())
+        metric = early_stop_metric(summary)
+        if require_metric is not None and metric != require_metric:
+            continue
         match = str(summary.get("mlp_match", parse_match_from_path(run_dir)))
         seed = parse_seed_from_path(run_dir)
         if seed is None:
             continue
         key = (match, seed)
-        table[key] = {
+        grouped.setdefault(key, []).append({
             "run_dir": str(run_dir),
             "summary": summary,
             "n_instances": int(summary.get("n_instances", 0)),
             "means": numeric_mean_fields(summary),
-        }
+            "early_stop_metric": metric,
+        })
+    table: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    for key, candidates in grouped.items():
+        chosen = sorted(candidates, key=lambda row: row["run_dir"])[-1]
+        table[key] = chosen
     return table
 
 
@@ -105,6 +124,12 @@ def main() -> None:
     ap.add_argument("--old-root", required=True, type=Path)
     ap.add_argument("--ext-root", required=True, type=Path)
     ap.add_argument("--out-dir", required=True, type=Path)
+    ap.add_argument(
+        "--require-early-stop-metric",
+        type=str,
+        default=None,
+        help="Only keep runs whose config.early_stop.metric matches this value.",
+    )
     args = ap.parse_args()
 
     old_root = args.old_root.expanduser().resolve()
@@ -112,8 +137,8 @@ def main() -> None:
     out_dir = args.out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    old_runs = collect_runs(old_root)
-    ext_runs = collect_runs(ext_root)
+    old_runs = collect_runs(old_root, require_metric=args.require_early_stop_metric)
+    ext_runs = collect_runs(ext_root, require_metric=args.require_early_stop_metric)
 
     common_keys = sorted(set(old_runs) & set(ext_runs))
     if not common_keys:

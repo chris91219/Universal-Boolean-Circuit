@@ -38,6 +38,22 @@
 + /bench_default_b1416_joint_1216/**/*.yaml
 + /bench_default_b1416_joint_1216/**/*.yml
 
++ /bench_default_b1820_joint_1216/
++ /bench_default_b1820_joint_1216/**/
++ /bench_default_b1820_joint_1216/**/*.json
++ /bench_default_b1820_joint_1216/**/*.jsonl
++ /bench_default_b1820_joint_1216/**/*.csv
++ /bench_default_b1820_joint_1216/**/*.yaml
++ /bench_default_b1820_joint_1216/**/*.yml
+
++ /bench_default_b1820_joint_1216_sharded/
++ /bench_default_b1820_joint_1216_sharded/**/
++ /bench_default_b1820_joint_1216_sharded/**/*.json
++ /bench_default_b1820_joint_1216_sharded/**/*.jsonl
++ /bench_default_b1820_joint_1216_sharded/**/*.csv
++ /bench_default_b1820_joint_1216_sharded/**/*.yaml
++ /bench_default_b1820_joint_1216_sharded/**/*.yml
+
 + /bench_default_best_analysis/
 + /bench_default_best_analysis/**/
 + /bench_default_best_analysis/**/*.json
@@ -190,6 +206,8 @@
 + /slurm-logs/ubc_robust_jump*.out
 + /slurm-logs/ubc_main_softmix*.out
 + /slurm-logs/ubc_b1416_joint*.out
++ /slurm-logs/ubc_b1820_joint*.out
++ /slurm-logs/ubc_b1820_combine*.out
 
 # ---- Exclude everything else ----
 - **
