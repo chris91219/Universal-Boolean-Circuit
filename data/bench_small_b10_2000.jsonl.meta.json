@@ -1,0 +1,27 @@
+{
+  "kind": "fresh_small_B",
+  "extended_out": "data/bench_small_b10_2000.jsonl",
+  "n_per_B": 400,
+  "seed": 20260421,
+  "total_rows": 2000,
+  "fresh_B": [
+    2,
+    4,
+    6,
+    8,
+    10
+  ],
+  "truth_table_formula_field": "formula",
+  "reduced_expr_is_metadata_only": true,
+  "ambient_dimension_field": "B",
+  "junta_size_field": "B_true",
+  "base_width_field": "W_base",
+  "base_depth_field": "D_base",
+  "legacy_base_width_alias": "S",
+  "legacy_base_depth_alias": "L",
+  "true_depth_field": "D_true",
+  "legacy_depth_alias": "L_true",
+  "legacy_heuristic_depth_field": "L_true_heuristic",
+  "true_width_field": "W_true",
+  "true_depth_width_method": "balanced_dnf_fanin2_with_projection_carries"
+}

@@ -81,12 +81,15 @@ APPEND_BS="${APPEND_BS:-14,16}"
 N_PER_B="${N_PER_B:-200}"
 DATASET_SEED="${DATASET_SEED:-20260429}"
 
-if [[ ! -f "${BASE_DATASET}" ]]; then
-  echo "[error] Missing base dataset: ${BASE_DATASET}"
-  exit 1
-fi
-
-if [[ ! -f "${COMBINED_DATASET}" || ! -f "${APPEND_DATASET}" ]]; then
+if [[ ! -f "${DATASET}" ]]; then
+  if [[ "${DATASET}" != "${APPEND_DATASET}" ]]; then
+    echo "[error] Missing run dataset: ${DATASET}"
+    exit 1
+  fi
+  if [[ ! -f "${BASE_DATASET}" ]]; then
+    echo "[error] Missing base dataset required to generate ${APPEND_DATASET}: ${BASE_DATASET}"
+    exit 1
+  fi
   echo "[info] generating benchmark extension datasets..."
   python "${PROJECT_DIR}/scripts/build_robustness_datasets.py" \
     --mode extend \

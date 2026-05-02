@@ -1,0 +1,12 @@
+{"B": 2, "S": 2, "L": 2, "formula": "(a0 | a1)", "meta": {"gate_set": "6", "family": "sop", "B_orig": 2}}
+{"B": 2, "S": 2, "L": 2, "formula": "(a0 & a1)", "meta": {"gate_set": "6", "family": "sop", "B_orig": 2}}
+{"B": 3, "S": 2, "L": 2, "formula": "((a1 & a2) | ((~a0) & a1))", "meta": {"gate_set": "6", "family": "sop", "B_orig": 4}}
+{"B": 2, "S": 2, "L": 2, "formula": "((~a0) & (~a1))", "meta": {"gate_set": "6", "family": "sop", "B_orig": 4}}
+{"B": 4, "S": 2, "L": 2, "formula": "(a2 | (((~a0) & (~a1)) & a3))", "meta": {"gate_set": "6", "family": "sop", "B_orig": 6}}
+{"B": 3, "S": 2, "L": 2, "formula": "((a0 & a1) | (a1 & (~a2)))", "meta": {"gate_set": "6", "family": "sop", "B_orig": 6}}
+{"B": 3, "S": 2, "L": 3, "formula": "((a1 & (~a2)) | ((a0 & (~a1)) & a2))", "meta": {"gate_set": "6", "family": "sop", "B_orig": 8}}
+{"B": 3, "S": 2, "L": 2, "formula": "((~a2) | (a0 & (~a1)))", "meta": {"gate_set": "6", "family": "sop", "B_orig": 8}}
+{"B": 3, "S": 2, "L": 2, "formula": "(((~a0) & a1) & a2)", "meta": {"gate_set": "6", "family": "sop", "B_orig": 10}}
+{"B": 6, "S": 2, "L": 3, "formula": "((((((~a0) & a1) & a2) & a3) & (~a4)) & a5)", "meta": {"gate_set": "6", "family": "sop", "B_orig": 10}}
+{"B": 5, "S": 2, "L": 3, "formula": "(((((~a0) & a1) & a2) & a3) & a4)", "meta": {"gate_set": "6", "family": "sop", "B_orig": 12}}
+{"B": 5, "S": 2, "L": 3, "formula": "((((a0 & (~a1)) & a2) & a3) & a4)", "meta": {"gate_set": "6", "family": "sop", "B_orig": 12}}

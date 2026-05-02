@@ -1,0 +1,28 @@
+{
+  "kind": "extended_high_B",
+  "base": "data/bench_default.jsonl",
+  "extended_out": "data/bench_default_ext_b20.jsonl",
+  "base_rows": 1200,
+  "append_B": [
+    14,
+    16,
+    18,
+    20
+  ],
+  "n_per_B": 200,
+  "seed": 20260421,
+  "total_rows": 2000,
+  "truth_table_formula_field": "formula",
+  "reduced_expr_is_metadata_only": true,
+  "ambient_dimension_field": "B",
+  "junta_size_field": "B_true",
+  "base_width_field": "W_base",
+  "base_depth_field": "D_base",
+  "legacy_base_width_alias": "S",
+  "legacy_base_depth_alias": "L",
+  "true_depth_field": "D_true",
+  "legacy_depth_alias": "L_true",
+  "legacy_heuristic_depth_field": "L_true_heuristic",
+  "true_width_field": "W_true",
+  "true_depth_width_method": "balanced_dnf_fanin2_with_projection_carries"
+}
